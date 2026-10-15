@@ -1,0 +1,56 @@
+{
+  "name": "@vheins/opencode-systemone",
+  "version": "0.1.0",
+  "description": "opencode plugin that routes TypeSafe Jev (System One) structured judgments through opencode's plugin hooks: tool guardrails, permission arbitration, cascade routing, and event triage.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Muhammad Rheza Alfin <aRhez0903@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vheins/opencode-jev.git"
+  },
+  "homepage": "https://github.com/vheins/opencode-jev#readme",
+  "bugs": {
+    "url": "https://github.com/vheins/opencode-jev/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "jev",
+    "systemone",
+    "system-one",
+    "typesafe",
+    "guardrail",
+    "ai"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0"
+  },
+  "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.13",
+    "@opencode-ai/sdk": "^1.18.13",
+    "@types/node": "^24.12.2",
+    "typescript": "^5.8.2"
+  }
+}

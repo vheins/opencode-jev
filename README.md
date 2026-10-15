@@ -1,4 +1,4 @@
-# opencode-jev
+# @vheins/opencode-systemone
 
 An [opencode](https://opencode.ai) plugin that routes **TypeSafe Jev (System One)** structured judgments through opencode's built-in plugin hooks.
 
@@ -7,6 +7,21 @@ Jev is not a drop-in model replacement. It answers named questions about a piece
 All Jev calls go through the existing **9router-spasi** provider, which exposes a pass-through route at `POST /v1/systemone`. The router forwards the body untouched and returns the native System One JSON.
 
 ## Install
+
+### From npm (recommended)
+
+Add the package to your opencode config (`opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["@vheins/opencode-systemone"]
+}
+```
+
+opencode installs the plugin with Bun at startup and caches it under `~/.cache/opencode/`. Then set the spasi key (see [Configuration](#configuration)) and restart opencode.
+
+### From source
 
 Copy the `.opencode/` directory into your opencode project (or point opencode at this plugin):
 
