@@ -1,5 +1,5 @@
 {
-  "name": "@vheins/opencode-systemone",
+  "name": "@vheins/opencode-system-one",
   "version": "0.1.0",
   "description": "opencode plugin that routes TypeSafe Jev (System One) structured judgments through opencode's plugin hooks: tool guardrails, permission arbitration, cascade routing, and event triage.",
   "type": "module",

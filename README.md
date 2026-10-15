@@ -1,4 +1,4 @@
-# @vheins/opencode-systemone
+# @vheins/opencode-system-one
 
 An [opencode](https://opencode.ai) plugin that routes **TypeSafe Jev (System One)** structured judgments through opencode's built-in plugin hooks.
 
@@ -15,7 +15,7 @@ Add the package to your opencode config (`opencode.json`):
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@vheins/opencode-systemone"]
+  "plugin": ["@vheins/opencode-system-one"]
 }
 ```
 
