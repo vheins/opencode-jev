@@ -37,6 +37,8 @@
  */
 
 import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 
 import type { Event } from "@opencode-ai/sdk"
 import type { Hooks, Plugin } from "@opencode-ai/plugin"
@@ -50,7 +52,7 @@ const SERVICE = "opencode-jev"
 const DEFAULT_BASE_URL = "https://model.spasi.biz.id/v1/systemone"
 
 /** Fallback key file written by the 9router-spasi provider setup. */
-const DEFAULT_KEY_FILE = "/home/kali/.config/opencode/.spasi-key"
+const DEFAULT_KEY_FILE = join(homedir(), ".config", "opencode", ".spasi-key")
 
 /**
  * Jev model id used when `JEV_MODEL` is unset.
@@ -119,6 +121,14 @@ type ChoiceVerdict<T extends string> = {
 
 /** A classified risk verdict. */
 type RiskVerdict = ChoiceVerdict<RiskLevel>
+
+/**
+ * Error thrown to block a destructive tool call.
+ *
+ * It is re-thrown past the hook's outer guard so an intentional block still
+ * propagates to opencode, while any unexpected error degrades to a no-op.
+ */
+class JevBlockError extends Error {}
 
 /** A yes/no answer as returned by the router. */
 type NoulAnswer = { type: "noul"; noul: number }
@@ -219,6 +229,19 @@ function safeStringify(value: unknown): string {
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message
   return String(error)
+}
+
+/**
+ * Cap a serialized state string so no Jev request body grows unbounded.
+ *
+ * Values at or under the cap pass through byte-identical.
+ *
+ * @param value - The serialized state string.
+ * @param max - Maximum character count; defaults to 4000.
+ * @returns The original string when within the cap, otherwise a truncated slice.
+ */
+function truncateState(value: string, max = 4000): string {
+  return value.length > max ? value.slice(0, max) : value
 }
 
 /**
@@ -350,13 +373,18 @@ export default (async (input) => {
     if (!apiKey) {
       throw new Error("No spasi key configured")
     }
+    const boundedState = truncateState(state)
     const response = await fetch(baseUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({ model: override?.trim() || model, state, questions }),
+      body: JSON.stringify({
+        model: override?.trim() || model,
+        state: boundedState,
+        questions,
+      }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
     if (!response.ok) {
@@ -577,81 +605,105 @@ export default (async (input) => {
     },
     "tool.execute.before": async (hookInput, output) => {
       if (!apiKey) return
-      const verdict = await classifyRisk({
-        tool: hookInput.tool,
-        args: output.args,
-      })
-      if (!verdict) return
-      await log("info", "Jev tool risk verdict", {
-        tool: hookInput.tool,
-        choice: verdict.choice,
-        confidence: verdict.confidence,
-      })
-      if (verdict.choice === "destructive" && verdict.confidence > blockThreshold) {
-        throw new Error(
-          `[jev] Blocked destructive tool "${hookInput.tool}" (confidence ${verdict.confidence.toFixed(3)} > ${blockThreshold}).`,
-        )
+      try {
+        const verdict = await classifyRisk({
+          tool: hookInput.tool,
+          args: output.args,
+        })
+        if (!verdict) return
+        await log("info", "Jev tool risk verdict", {
+          tool: hookInput.tool,
+          choice: verdict.choice,
+          confidence: verdict.confidence,
+        })
+        if (verdict.choice === "destructive" && verdict.confidence > blockThreshold) {
+          throw new JevBlockError(
+            `[jev] Blocked destructive tool "${hookInput.tool}" (confidence ${verdict.confidence.toFixed(3)} > ${blockThreshold}).`,
+          )
+        }
+      } catch (error) {
+        // An intentional block must still propagate; anything else degrades to a no-op.
+        if (error instanceof JevBlockError) throw error
+        await log("warn", "Jev tool guard failed", { error: errorMessage(error) })
       }
     },
     "permission.ask": async (permission, output) => {
       if (!apiKey) return
-      const verdict = await classifyRisk({
-        permission: permission.type,
-        pattern: permission.pattern,
-        title: permission.title,
-      })
-      if (!verdict) return
-      await log("info", "Jev permission verdict", {
-        permission: permission.type,
-        choice: verdict.choice,
-        confidence: verdict.confidence,
-      })
-      if (verdict.choice === "read_only" && verdict.confidence >= allowThreshold) {
-        output.status = "allow"
-      } else if (
-        verdict.choice === "destructive" &&
-        verdict.confidence > blockThreshold
-      ) {
-        output.status = "deny"
+      try {
+        const verdict = await classifyRisk({
+          permission: permission.type,
+          pattern: permission.pattern,
+          title: permission.title,
+        })
+        if (!verdict) return
+        await log("info", "Jev permission verdict", {
+          permission: permission.type,
+          choice: verdict.choice,
+          confidence: verdict.confidence,
+        })
+        if (verdict.choice === "read_only" && verdict.confidence >= allowThreshold) {
+          output.status = "allow"
+        } else if (
+          verdict.choice === "destructive" &&
+          verdict.confidence > blockThreshold
+        ) {
+          output.status = "deny"
+        }
+        // Otherwise leave the status untouched: opencode escalates to the human.
+      } catch (error) {
+        await log("warn", "Jev permission arbitration failed", {
+          error: errorMessage(error),
+        })
       }
-      // Otherwise leave the status untouched: opencode escalates to the human.
     },
     "chat.message": async (_hookInput, output) => {
       if (!apiKey) return
-      const text = extractText(output.parts)
-      if (!text) return
-      const verdict = await classifyChoice(
-        "route",
-        "Cascade-route this user message. Choose code_only if it is fully answerable by reading or editing code with no external judgment, needs_model if it needs language-model reasoning but no human decision, or needs_human if it needs a human decision, approval, private context, or is ambiguous or high-stakes.",
-        ROUTE_CRITERIA,
-        { message: text },
-      )
-      if (!verdict) return
-      await log("info", "Jev cascade routing verdict", {
-        route: verdict.choice,
-        confidence: verdict.confidence,
-      })
-      if (verdict.choice === "needs_human" && verdict.confidence >= alertThreshold) {
-        await toast(
-          `Message routed to needs_human (confidence ${verdict.confidence.toFixed(2)}).`,
-          "warning",
-          "Jev cascade routing",
+      try {
+        const text = extractText(output.parts)
+        if (!text) return
+        const verdict = await classifyChoice(
+          "route",
+          "Cascade-route this user message. Choose code_only if it is fully answerable by reading or editing code with no external judgment, needs_model if it needs language-model reasoning but no human decision, or needs_human if it needs a human decision, approval, private context, or is ambiguous or high-stakes.",
+          ROUTE_CRITERIA,
+          { message: text },
         )
+        if (!verdict) return
+        await log("info", "Jev cascade routing verdict", {
+          route: verdict.choice,
+          confidence: verdict.confidence,
+        })
+        if (verdict.choice === "needs_human" && verdict.confidence >= alertThreshold) {
+          await toast(
+            `Message routed to needs_human (confidence ${verdict.confidence.toFixed(2)}).`,
+            "warning",
+            "Jev cascade routing",
+          )
+        }
+      } catch (error) {
+        await log("warn", "Jev cascade routing failed", {
+          error: errorMessage(error),
+        })
       }
     },
     "experimental.session.compacting": async (_hookInput, output) => {
       if (!apiKey) return
-      const probability = await classifyNoul(
-        "unrecoverable",
-        "Does this session hold unrecoverable decisions, findings, or context that must be preserved in the summary to avoid losing work?",
-        { context: output.context },
-      )
-      if (probability === undefined) return
-      await log("info", "Jev compaction judgment", { probability })
-      if (probability >= compactThreshold) {
-        output.context.push(
-          "[jev] This session likely holds unrecoverable decisions; preserve decisions, findings, and next steps explicitly.",
+      try {
+        const probability = await classifyNoul(
+          "unrecoverable",
+          "Does this session hold unrecoverable decisions, findings, or context that must be preserved in the summary to avoid losing work?",
+          { context: output.context },
         )
+        if (probability === undefined) return
+        await log("info", "Jev compaction judgment", { probability })
+        if (probability >= compactThreshold) {
+          output.context.push(
+            "[jev] This session likely holds unrecoverable decisions; preserve decisions, findings, and next steps explicitly.",
+          )
+        }
+      } catch (error) {
+        await log("warn", "Jev compaction judgment failed", {
+          error: errorMessage(error),
+        })
       }
     },
     event: async (hookInput) => {

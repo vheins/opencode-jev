@@ -23,14 +23,16 @@ opencode installs the plugin with Bun at startup and caches it under `~/.cache/o
 
 ### From source
 
-Copy the `.opencode/` directory into your opencode project (or point opencode at this plugin):
+Clone this repository (or copy **both** the `.opencode/` directory **and** the root `src/` directory, preserving their relative layout). The local plugin entry `.opencode/plugins/jev.ts` is a thin re-export of `../../src/index`, so `src/` must sit beside `.opencode/`:
 
 ```
 your-project/
   .opencode/
-    plugins/jev.ts
+    plugins/jev.ts        # re-exports ../../src/index
     package.json
     .env.example
+  src/
+    index.ts              # canonical plugin source
 ```
 
 opencode auto-discovers any `*.ts` file in `.opencode/plugins/`, so `jev.ts` loads automatically. Install the plugin's dependencies once:
@@ -56,7 +58,7 @@ Copy `.opencode/.env.example` to `.env` (or export the variables in your shell).
 | `JEV_SEVERITY_THRESHOLD` | `0.8` | Toast when a `session.error` severity resolves to `real_bug`/`fatal` at or above this confidence. |
 | `JEV_COMPACT_THRESHOLD` | `0.75` | Append a preservation reminder to compaction context at or above this probability. |
 
-Key resolution order: `SPASI_API_KEY` environment variable, then the file `/home/kali/.config/opencode/.spasi-key`. **Never commit a real key.** The repository ignores `.env`, `*.key`, and similar files.
+Key resolution order: `SPASI_API_KEY` environment variable, then the file `~/.config/opencode/.spasi-key`. **Never commit a real key.** The repository ignores `.env`, `*.key`, and similar files.
 
 ## Hook / event map
 
