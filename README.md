@@ -128,8 +128,20 @@ The JEV key and the base URL are both required; if neither source supplies one, 
 | `severityThreshold` | `JEV_SEVERITY_THRESHOLD` | `0.8` | Toast when a `session.error` severity resolves to `real_bug`/`fatal` at or above this confidence. |
 | `compactThreshold` | `JEV_COMPACT_THRESHOLD` | `0.75` | Append a preservation reminder to compaction context at or above this probability. |
 | `fileReviewThreshold` | `JEV_FILE_REVIEW_THRESHOLD` | `0.8` | Toast when an edited file is judged security-sensitive at or above this probability. |
+| `decisionLogPath` | `JEV_DECISION_LOG` | `~/.config/opencode/jev-decisions.log` | Newline-delimited JSON decision log. An empty string or `off` disables logging. |
+| `decisionLogMaxBytes` | `JEV_DECISION_LOG_MAX_BYTES` | `1000000` | Rotate the decision log once it reaches this many bytes. |
+| `decisionLogBackups` | `JEV_DECISION_LOG_BACKUPS` | `3` | Number of rotated copies to keep (`<path>.1` .. `<path>.N`). |
+| `toastDecisions` | `JEV_TOAST_DECISIONS` | `false` | Toast **every** decision (not just the three default toasts). |
 
-Thresholds are per category; there is no single global threshold across unrelated decisions. A value outside `[0, 1]` is ignored and the default is used, so a typo cannot widen a guardrail silently. A wrong-typed option is likewise ignored (the environment value then applies) and logs a one-time warning naming the field, never its value.
+Thresholds are per category; there is no single global threshold across unrelated decisions. A value outside `[0, 1]` is ignored and the default is used, so a typo cannot widen a guardrail silently. A wrong-typed option is likewise ignored (the environment value then applies) and logs a one-time warning naming the field, never its value. The decision-log fields are validated the same way: `decisionLogMaxBytes` and `decisionLogBackups` must be non-negative integers, and `toastDecisions` must be a boolean.
+
+### Decision observability
+
+opencode's plugin hooks all return `Promise<void>` and **cannot inject an assistant message**, so Jev has no way to surface a decision as chat text. Instead, every decision is written to the decision log, and optionally toasted:
+
+- **Decision log** — one JSON object per line: `ts`, `hook`, `kind` (`valid`/`abstain`/`invalid`/`unavailable`), `decision` (the chosen label, or `null`), `confidence` (or `null`), `action` (`block`/`allow`/`toast`/`log`/`context`/`return`/`none`), and an optional short `detail`. The log rotates on size: when it reaches `decisionLogMaxBytes`, `<path>` becomes `<path>.1`, older copies shift up, and anything beyond `decisionLogBackups` is dropped. The file is created (with parent directories) on first write; a write failure is warned once and never thrown into a hook. The API key, request body, and full state are never written, and `detail` is truncated to 200 characters.
+- **Startup proof** — when Jev is enabled, the plugin emits one `Jev enabled: model=…, baseUrl=<host>, key=<set|missing>` log line (host only, never the full URL or the key value). With `toastDecisions` on, the same line is also shown as a toast.
+- **Toast every decision** — with `toastDecisions: false` (default) the three default toasts still fire (confident `needs_human`, confident non-transient error severity, security-sensitive file edit); with `toastDecisions: true` every decision also surfaces a toast, including the ones that would otherwise only be logged.
 
 ### Security: prefer env or the key file for the secret
 
@@ -159,7 +171,7 @@ The plugin is designed so it can never break opencode's flow and never weakens t
 - **Per-category failure policy** — a non-actionable verdict for a high-impact action (destructive or high-impact category) surfaces a warning; low-risk categories stay silent. Neither case relaxes opencode's native approval flow.
 - **Block only** — `tool.execute.before` either throws (deny) or returns (defer). The plugin cannot auto-allow, so a model verdict never bypasses opencode's permission controls.
 - **Bounded network** — each request carries an `AbortSignal.timeout` and at most one retry, and only for transient failures (timeouts, connection errors, `429`, and `5xx`). A deterministic `4xx` is never retried.
-- **No secret leakage** — the API key and request bodies are never written to logs.
+- **No secret leakage** — the API key and request bodies are never written to logs or the decision log.
 - **Validated answers** — a `choice` verdict must carry a known label, a finite confidence in `[0, 1]`, and a probability map that does not contradict the selected label. A `noul` verdict must carry a probability in `[0, 1]`.
 
 ## Development
