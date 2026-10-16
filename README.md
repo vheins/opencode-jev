@@ -90,22 +90,27 @@ The object form `{"package": "...", "options": {...}}` is **not** supported by o
 
 ### From source
 
-Clone this repository (or copy **both** the `.opencode/` directory **and** the root `src/` directory, preserving their relative layout). The local plugin entry `.opencode/plugins/jev.ts` is a thin re-export of `../../src/index`, so `src/` must sit beside `.opencode/`:
+Clone this repository (or copy the root `src/` directory). The canonical plugin source is `src/index.ts`; register it from your opencode config so a single resolution path loads it:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["/absolute/path/to/opencode-jev/src/index.ts"]
+}
+```
 
 ```
 your-project/
-  .opencode/
-    plugins/jev.ts        # re-exports ../../src/index
-    package.json
-    .env.example
   src/
     index.ts              # canonical plugin source
 ```
 
-opencode auto-discovers any `*.ts` file in `.opencode/plugins/`, so `jev.ts` loads automatically. Install the plugin's dependencies once:
+Registering the plugin once (here or via the package name above) is deliberate: loading it from **both** an `.opencode/plugins/*.ts` auto-discovery entry **and** an `opencode.json` entry makes opencode load it twice, so every hook fires twice.
+
+opencode loads the plugin with Bun at startup. Install the plugin's dependencies once:
 
 ```bash
-cd .opencode && bun install   # or: npm install
+cd /absolute/path/to/opencode-jev && bun install   # or: npm install
 ```
 
 Then restart opencode (config and plugins load at startup).
@@ -156,7 +161,7 @@ Key resolution order: the `apiKey` option, then the `JEV_API_KEY` environment va
 
 | Hook or event | Jev question | Behavior |
 | --- | --- | --- |
-| `tool.execute.before` | Choice: `read_only` \| `mutating` \| `destructive` | Blocks (throws) when the verdict is `destructive` and confidence > `JEV_BLOCK_THRESHOLD`. Known read-only tools skip the call. Runs on a tight budget: no retry, so worst-case blocking latency is one `timeoutMs` (~3s). It never auto-allows; opencode's native flow still decides everything else. |
+| `tool.execute.before` | Choice: `read_only` \| `mutating` \| `destructive` | Blocks (throws) when the verdict is `destructive` and confidence > `JEV_BLOCK_THRESHOLD`. Low-risk tools skip the call: the read-only set (`read`, `list`, `glob`, `grep`, `todoread`, `webfetch`) plus the meta tools `todowrite` and `task-read`. The dispatch tool `task` and every mutating tool (`edit`, `write`, `bash`, `execute`, `memory-write`) stay on the network path. Runs on a tight budget: no retry, so worst-case blocking latency is one `timeoutMs` (~3s). It never auto-allows; opencode's native flow still decides everything else. |
 | `chat.message` | Deterministic local score | Scores each user message for high-stakes signals (destructive verbs on production data, secrets, approvals, migrations) with **no Jev call**. Raises a TUI toast when the score reaches `JEV_ROUTE_THRESHOLD`. This hook is **observe-only**: it cannot reroute the message. |
 | `experimental.session.compacting` | Noul: "does this session hold unrecoverable decisions?" | Pushes a preservation reminder line into the summary context when the probability is high. Never replaces the compaction prompt. |
 | `event` → `session.error` | Choice: `transient` \| `real_bug` \| `fatal` | Logs the severity; raises a toast on a confident non-transient verdict. A `MessageAbortedError` is ignored. |
@@ -175,6 +180,8 @@ The plugin is designed so it can never break opencode's flow and never weakens t
 - **Block only** — `tool.execute.before` either throws (deny) or returns (defer). The plugin cannot auto-allow, so a model verdict never bypasses opencode's permission controls.
 - **Never blocks the loop** — a Jev answer can only *add* a block; it can never stall the main agent loop. The blocking hook runs on a tight budget with no retry, so a hung provider fails open after one `timeoutMs` (~3s), including when the local hint is destructive.
 - **Bounded network** — each request carries an `AbortSignal.timeout` (default 3000ms, configurable). Non-blocking hooks retry at most once, and only for transient failures (timeouts, connection errors, `429`, and `5xx`); the blocking `tool.execute.before` hook never retries. A deterministic `4xx` is never retried.
+- **Failure short-circuit** — after three consecutive provider/transport/timeout failures the client opens a short-TTL (5s) circuit and fails open without any network call, so a down provider is not hit by every hook. A single success resets the streak. It is bounded and fail-open: it never throws and never stalls.
+- **Diagnosable failures** — a provider failure records its HTTP status and a bounded, single-line, key-redacted response-body snippet (clipped to 200 characters) in the decision-log `detail`, so `unavailable:provider` is no longer opaque. The API key is redacted from the snippet before it is stored.
 - **No secret leakage** — the API key and request bodies are never written to logs or the decision log.
 - **Validated answers** — a `choice` verdict must carry a known label, a finite confidence in `[0, 1]`, and a probability map that does not contradict the selected label. A `noul` verdict must carry a probability in `[0, 1]`.
 
