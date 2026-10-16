@@ -28,7 +28,10 @@ test("loadConfig: blank JEV_BASE_URL is treated as unset (no default host)", () 
 })
 
 test("loadConfig: missing key disables Jev with missing-key", () => {
-  const { config, disabledReason } = loadConfig({ JEV_BASE_URL: "https://router.example/v1/systemone" }, undefined)
+  // Pass "" (not undefined) so the resolveApiKey() default parameter — which
+  // would read the real ~/.config/opencode/.jev-key — is never triggered. This
+  // keeps the test hermetic on a machine that has the key file present.
+  const { config, disabledReason } = loadConfig({ JEV_BASE_URL: "https://router.example/v1/systemone" }, "")
   assert.equal(config.enabled, false)
   assert.equal(disabledReason, "missing-key")
 })
@@ -45,9 +48,11 @@ test("loadConfig: both key and base URL present enables Jev", () => {
 })
 
 test("loadConfig: no spasi/custom domain appears as a default", () => {
-  const { config } = loadConfig({}, undefined)
+  // Pass "" (not undefined) so the resolveApiKey() default parameter is not
+  // triggered and the test never reads a real key file from the host.
+  const { config } = loadConfig({}, "")
   assert.equal(config.baseUrl, undefined)
-  assert.equal(config.apiKey, undefined)
+  assert.equal(config.apiKey, "")
   assert.equal(config.enabled, false)
 })
 

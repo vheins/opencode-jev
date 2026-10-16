@@ -159,3 +159,47 @@ test("request: returns busy when the client is not configured", async () => {
   assert.equal(result.ok, false)
   if (!result.ok) assert.equal(result.failure.kind, "busy")
 })
+
+test("request: retries a 429 exactly once and succeeds on the second attempt", async () => {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    if (calls === 1) return new Response("slow down", { status: 429 })
+    return new Response(JSON.stringify({ model: "m", answers: {}, usage: {} }), { status: 200 })
+  }) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+  const result = await client.request("state", QUESTIONS)
+  assert.equal(result.ok, true)
+  assert.equal(calls, 2, "429 is transient and must be retried exactly once")
+})
+
+test("request: a 200 with invalid JSON maps to transport failure", async () => {
+  globalThis.fetch = (async () => new Response("not-json{", { status: 200 })) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+  const result = await client.request("state", QUESTIONS)
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.equal(result.failure.kind, "transport")
+})
+
+test("request: a >4000-char state is truncated in the wire body and the cache key", async () => {
+  const bodies: Array<{ state: string }> = []
+  let calls = 0
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    calls += 1
+    const parsed = JSON.parse(String(init?.body)) as { state: string }
+    bodies.push({ state: parsed.state })
+    return new Response(JSON.stringify({ model: "m", answers: {}, usage: {} }), { status: 200 })
+  }) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+
+  // Two states that share their first 4000 characters must truncate to the
+  // same bounded string, so the second request is served from cache.
+  const longA = "x".repeat(5000)
+  const longB = "x".repeat(4000) + "y".repeat(1000)
+  await client.request(longA, QUESTIONS)
+  await client.request(longB, QUESTIONS)
+
+  assert.equal(bodies.length, 1, "the truncated state must be the cache key")
+  assert.ok((bodies[0]?.state.length ?? 0) <= 4000, "wire body state must be bounded to <=4000 chars")
+  assert.equal(bodies[0]?.state, "x".repeat(4000))
+})
