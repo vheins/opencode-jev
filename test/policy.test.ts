@@ -14,6 +14,7 @@ import { test } from "node:test"
 
 import {
   categoryForRisk,
+  classifyFileSensitivity,
   classifyLocally,
   failurePolicy,
   isHighImpact,
@@ -65,4 +66,18 @@ test("isHighImpact: only destructive and high_impact are high-impact", () => {
   assert.equal(isHighImpact("high_impact"), true)
   assert.equal(isHighImpact("reversible"), false)
   assert.equal(isHighImpact("read_only"), false)
+})
+
+test("classifyFileSensitivity: sensitive paths score high, ordinary paths score 0", () => {
+  assert.equal(classifyFileSensitivity(".env").score, 0.9)
+  assert.equal(classifyFileSensitivity("config/id_rsa").score, 0.9)
+  assert.equal(classifyFileSensitivity("src/index.ts").score, 0)
+})
+
+test("classifyFileSensitivity: malformed input never throws and scores 0", () => {
+  for (const input of [undefined as any, 123 as any, null as any, {} as any, ""]) {
+    const result = classifyFileSensitivity(input)
+    assert.equal(result.score, 0, `input=${String(input)}`)
+    assert.equal(typeof result.reason, "string")
+  }
 })

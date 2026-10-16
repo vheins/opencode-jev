@@ -133,10 +133,11 @@ export type FileSensitivity = { readonly score: number; readonly reason: string 
  * user-visible advisory without paying for a Jev call on every edit. The
  * returned score is gated by the caller's `fileReviewThreshold`.
  *
- * @param file - The edited file path.
+ * @param file - The edited file path; malformed (non-string) input is tolerated.
  * @returns The graded score in `[0, 1]` and the matching reason.
  */
-export function classifyFileSensitivity(file: string): FileSensitivity {
+export function classifyFileSensitivity(file: unknown): FileSensitivity {
+  if (typeof file !== "string") return { score: 0, reason: "invalid path" }
   const normalized = file.trim()
   if (normalized === "") return { score: 0, reason: "empty path" }
   let score = 0
