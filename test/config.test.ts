@@ -506,3 +506,60 @@ test("mutation proof: the tool gate default depends on DEFAULT_ENABLE_TOOL_GATE 
   )
   assert.equal(config.enableToolGate, false)
 })
+
+test("loadConfig: cooldownMs defaults to 30000 when nothing is set", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.cooldownMs, 30_000)
+})
+
+test("loadConfig: JEV_COOLDOWN_MS env overrides the default window", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_COOLDOWN_MS: "5000" },
+    "k",
+  )
+  assert.equal(config.cooldownMs, 5_000)
+})
+
+test("loadConfig: a cooldownMs option overrides the env (options > env)", () => {
+  const { config } = loadConfig(
+    { cooldownMs: 1_000 },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_COOLDOWN_MS: "5000" },
+    "k",
+  )
+  assert.equal(config.cooldownMs, 1_000)
+})
+
+test("loadConfig: cooldownMs=0 is a valid value that disables the gate", () => {
+  const { config, warnings } = loadConfig(
+    { cooldownMs: 0 },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.cooldownMs, 0)
+  assert.equal(warnings.length, 0, "0 is a valid 'disable' value, not a warning")
+})
+
+test("loadConfig: an invalid cooldownMs option is ignored, falls back to env, and warns", () => {
+  const { config, warnings } = loadConfig(
+    { cooldownMs: -1 },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_COOLDOWN_MS: "5000" },
+    "k",
+  )
+  assert.equal(config.cooldownMs, 5_000, "a negative option must fall back to the env")
+  assert.equal(warnings.length, 1)
+  assert.equal(warnings[0]?.field, "cooldownMs")
+})
+
+test("loadConfig: an invalid JEV_COOLDOWN_MS falls back to the default", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_COOLDOWN_MS: "-5" },
+    "k",
+  )
+  assert.equal(config.cooldownMs, 30_000, "a negative env window must fall back to the default")
+})

@@ -120,6 +120,16 @@ export const DEFAULT_TIMEOUT_MS = 3_000
 
 /** How long a decision may be reused for identical input (ms). */
 export const DEFAULT_CACHE_TTL_MS = 60_000
+
+/**
+ * Default cooldown window (ms) for the selective trigger gate.
+ *
+ * A repeat judgement for the same logical action within this window reuses the
+ * previous outcome instead of re-asking the model, so consecutive tool calls of
+ * one logical decision collapse to a single judgement. `0` disables the gate's
+ * cooldown/dedup entirely.
+ */
+export const DEFAULT_COOLDOWN_MS = 30_000
 /** Maximum number of in-flight Jev requests; further calls fail fast as `busy`. */
 export const MAX_CONCURRENT_REQUESTS = 4
 
@@ -165,6 +175,8 @@ export type Config = {
   readonly timeoutMs: number
   /** Decision cache TTL (ms). */
   readonly cacheTtlMs: number
+  /** Selective-trigger cooldown window (ms); `0` disables dedup/cooldown. */
+  readonly cooldownMs: number
   /** Maximum concurrent Jev requests. */
   readonly maxConcurrent: number
 }
@@ -352,6 +364,15 @@ export function loadConfig(
         options,
         "cacheTtlMs",
         parsePositiveInt(env.JEV_CACHE_TTL_MS, DEFAULT_CACHE_TTL_MS),
+        warnings,
+      ),
+      // A non-negative integer: `0` is a valid value that disables the gate's
+      // dedup/cooldown, so this uses the count readers rather than the
+      // positive-int readers (which reject 0).
+      cooldownMs: countOption(
+        options,
+        "cooldownMs",
+        parseCount(env.JEV_COOLDOWN_MS, DEFAULT_COOLDOWN_MS),
         warnings,
       ),
       maxConcurrent: MAX_CONCURRENT_REQUESTS,

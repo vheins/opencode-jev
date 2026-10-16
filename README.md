@@ -147,6 +147,7 @@ The JEV key and the base URL are both required; if neither source supplies one, 
 | `traceLogBackups` | `JEV_TRACE_LOG_BACKUPS` | `3` | Number of rotated trace-log copies to keep. |
 | `toastDecisions` | `JEV_TOAST_DECISIONS` | `false` | Toast **every** decision (not just the three default toasts). |
 | `enableToolGate` | `JEV_TOOL_GATE` | `false` | Run the automatic `tool.execute.before` risk gate. **Off by default**: judgement is on-demand via `tool.jev_decide`, and opencode's native permission flow is the sole gate for tool calls. Enable to restore the automatic destructive-tool block. |
+| `cooldownMs` | `JEV_COOLDOWN_MS` | `30000` | Selective-trigger cooldown window (ms). A repeat judgement for the same logical action within this window reuses the previous outcome instead of re-asking the model, so consecutive calls of one logical decision collapse to a single judgement. `0` disables dedup/cooldown. Must be a non-negative integer; an invalid value is ignored and warned. |
 
 Thresholds are per category; there is no single global threshold across unrelated decisions. A value outside `[0, 1]` is ignored and the default is used, so a typo cannot widen a guardrail silently. A wrong-typed option is likewise ignored (the environment value then applies) and logs a one-time warning naming the field, never its value. The decision-log fields are validated the same way: `decisionLogMaxBytes` and `decisionLogBackups` must be non-negative integers, and `toastDecisions` must be a boolean. `timeoutMs` must be a positive integer; a non-positive or non-integer value is ignored and warned.
 
@@ -183,7 +184,18 @@ Key resolution order: the `apiKey` option, then the `JEV_API_KEY` environment va
 | `experimental.session.compacting` | Noul: "does this session hold unrecoverable decisions?" | Pushes a preservation reminder line into the summary context when the probability is high. Never replaces the compaction prompt. |
 | `event` → `session.error` | Choice: `transient` \| `real_bug` \| `fatal` | Logs the severity; raises a toast on a confident non-transient verdict. A `MessageAbortedError` is ignored. |
 | `event` → `file.edited` | Deterministic local path check | Scores the edited path for security-sensitive patterns (`.env`, key material, CI auth) with **no Jev call**, and raises a review toast when the score reaches `JEV_FILE_REVIEW_THRESHOLD`. |
-| `tool.jev_decide` (custom tool) | Choice / Score / Noul over arbitrary state | The primary, on-demand judgement path. Exposes Jev directly to the agent; validates the answer per type and returns the typed answer as JSON. |
+| `tool.jev_decide` (custom tool) | Choice / Score / Noul over arbitrary state | The primary, on-demand judgement path. Exposes Jev directly to the agent; validates the answer per type and returns the typed answer as JSON. An **identical** repeated call (same tool + scope + questions) within the cooldown window reuses the previous result instead of re-asking; a distinct question always re-asks. |
+| `tool.jev_metrics` (custom tool) | — | Reports effectiveness metrics for the judgement layer: System One call count, added latency (ms), duplication rate, and decision-influence rate. Derived in memory from the same signals the decision/trace logs persist, so reading it performs **no IO**. |
+
+### Selective trigger (dedup + cooldown)
+
+Judgement is a **selective** decision layer, not a per-tool-call examiner. In front of `judge()`/`decidePolicy()` a trigger gate collapses consecutive calls of ONE logical decision:
+
+- **Dedup** — an identical judgement (same tool + scope + questions) within the `cooldownMs` window reuses the previous outcome instead of re-asking the model.
+- **Cooldown** — a repeat judgement for the same logical action within the window is suppressed and the previous outcome replayed.
+- **One judgement per logical decision** — the gate groups only a **proven-safe** equivalence class (a locally-recognized destructive hint keyed by its exact matched pattern). An unproven action is never grouped and is judged on its own, so a genuinely different decision is never suppressed.
+- **Additive and fail-open** — a reuse **replays** a decision that was already computed, so it can only re-apply the same outcome (including a block) and can never invent an allow or relax opencode's native permission flow. Both guards never block on their own.
+- **Metrics** — `tool.jev_metrics` reports calls, added latency, duplication rate, and decision-influence rate (how many judgements changed the decision: `verify`/`revise`/`request-approval` vs a silent `proceed`), derived from the same signals the decision log (`action`) and trace log (`durationMs`) persist. Reading them adds no IO, in particular nothing when tracing is off.
 
 ### When to consult `jev_decide`
 

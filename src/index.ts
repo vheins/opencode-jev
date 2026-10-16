@@ -72,10 +72,12 @@ import {
   classifyMessage,
   failurePolicy,
   riskCacheScope,
+  riskLogicalKey,
   type ActionCategory,
   type LocalClassification,
 } from "./policy.ts"
 import type { TraceLogOptions } from "./trace-log.ts"
+import { gateJudgement, TriggerGate, TriggerMetrics } from "./trigger.ts"
 import { parseResponse, unavailable } from "./validate.ts"
 /** Log service name stamped on every entry this plugin emits. */
 const SERVICE = "opencode-jev"
@@ -364,6 +366,14 @@ export default (async (input, options?: PluginOptions) => {
 
   const systemOne = new SystemOneClient(config, POLICY_VERSION, traceLog)
 
+  // The selective trigger gate collapses consecutive calls of ONE logical
+  // decision into a single judgement; the metrics collector records the effect
+  // in memory (no IO of its own). Both are ADDITIVE: a reuse replays an
+  // already-computed outcome, so it can never invent an allow or relax the
+  // native permission flow.
+  const triggerGate = new TriggerGate({ cooldownMs: config.cooldownMs })
+  const metrics = new TriggerMetrics()
+
   /**
    * Append a decision to the JSON log, reporting a write failure at most once.
    *
@@ -464,6 +474,25 @@ export default (async (input, options?: PluginOptions) => {
     }
   }
 
+  /**
+   * Effectiveness metrics for the judgement layer, exposed as an on-demand read.
+   *
+   * The counters are maintained in memory as judgements happen and are derived
+   * from the same signals the decision log (`action`) and trace log
+   * (`durationMs`) persist, so reading them adds NO IO — nothing is read or
+   * written, in particular when tracing is off. `decisionInfluence` counts
+   * judgements whose action was not a silent proceed; `duplicationRate` counts
+   * judgements the trigger gate served from a dedup/cooldown reuse.
+   */
+  const jevMetrics = tool({
+    description:
+      "Report effectiveness metrics for the Jev judgement layer: System One call count, added latency (ms), duplication rate, and decision-influence rate. Derived in memory from the same signals the decision/trace logs persist; reading it performs no IO.",
+    args: {},
+    async execute() {
+      return safeStringify(metrics.snapshot())
+    },
+  })
+
   const jevDecide = tool({
     description:
       "Ask TypeSafe Jev (System One) a structured judgment about arbitrary state, routed through the router provider. Supports choice, score, and noul question types and returns the typed answer as JSON.\n\n" +
@@ -512,9 +541,33 @@ export default (async (input, options?: PluginOptions) => {
       })()
       if (!questions) return `type=${args.type} requires at least two criteria entries.`
 
+      // On-demand judgement: dedup an IDENTICAL question (same tool + scope +
+      // questions) so a repeated identical call reuses the result instead of
+      // re-asking. Cooldown is disabled here — a distinct explicit question is a
+      // distinct logical decision and must never be collapsed into another.
+      const fingerprint = safeStringify({
+        type: args.type,
+        instructions: args.instructions,
+        state: args.state,
+        choiceCriteria: args.choiceCriteria ?? null,
+        scoreCriteria: args.scoreCriteria ?? null,
+        noulCriteria: args.noulCriteria ?? null,
+        model: args.model ?? null,
+      })
+      const gate = gateJudgement(triggerGate, metrics, "tool.jev_decide", fingerprint, {
+        cooldown: false,
+      })
+      if (gate.kind === "reuse") {
+        await log("info", "jev_decide reused an identical judgement", { type: args.type })
+        const replayed = triggerGate.replay("tool.jev_decide")
+        if (typeof replayed === "string") return replayed
+      }
+
+      const startedAt = Date.now()
       const result = await systemOne.request(args.state, questions, args.model, {
         trace: { hook: "tool.jev_decide", summary: args.type },
       })
+      metrics.recordSystemOneCall(Date.now() - startedAt)
       if (!result.ok) {
         await log("error", "jev_decide failed", { type: args.type, failure: result.failure.kind })
         await record("tool.jev_decide", { kind: "unavailable", decision: null, confidence: null }, "return", args.type)
@@ -548,18 +601,21 @@ export default (async (input, options?: PluginOptions) => {
           usage: parsed.usage,
         })
       }
-      return safeStringify({
+      const answer = safeStringify({
         model: parsed.model,
         valid: true,
         answer: decision.verdict,
         usage: parsed.usage,
       })
+      triggerGate.remember("tool.jev_decide", answer)
+      return answer
     },
   })
 
   return {
     tool: {
       jev_decide: jevDecide,
+      jev_metrics: jevMetrics,
     },
     "tool.execute.before": async (hookInput, output) => {
       // OPTIONAL automatic gate, OFF by default (MEM-037): judgement is
@@ -571,7 +627,35 @@ export default (async (input, options?: PluginOptions) => {
       const local = classifyLocally(hookInput.tool, output.args)
       if (local.kind === "read_only") return
       const category = localCategory(local)
+      // The selective trigger gate: a proven-safe logical key groups consecutive
+      // calls of ONE logical decision, so a repeat within the cooldown window
+      // replays the previous outcome instead of re-asking the model. An
+      // unproven action (`undefined`) is never grouped and is judged on its own.
+      const logicalKey = riskLogicalKey(hookInput.tool, output.args)
       try {
+        if (logicalKey !== undefined) {
+          const fingerprint = `${logicalKey}\u0000${safeStringify(output.args)}`
+          const outcome = gateJudgement(triggerGate, metrics, logicalKey, fingerprint)
+          if (outcome.kind === "reuse") {
+            // Replay the already-computed outcome: a remembered block still
+            // blocks (additive), and a remembered allow defers to the native
+            // flow exactly as the original judgement did. No network call.
+            const replay = triggerGate.replay(logicalKey) as
+              | { readonly blocked: boolean; readonly message?: string }
+              | undefined
+            await log("info", "Jev tool gate reused a judgement", {
+              tool: hookInput.tool,
+              reason: outcome.reason,
+            })
+            if (replay?.blocked) throw new JevBlockError(replay.message ?? "[jev] Blocked by a reused judgement.")
+            return
+          }
+        } else {
+          // No proven-safe logical key (the `unknown` class): the action is
+          // judged on its own, but it is still a judgement the metrics count.
+          metrics.recordTrigger()
+        }
+        const startedAt = Date.now()
         // Ask Jev for the risk verdict, then validate the answer against the
         // risk label domain via `judge`. A transport failure becomes an
         // `unavailable` decision, so the same fail-open policy applies.
@@ -600,6 +684,7 @@ export default (async (input, options?: PluginOptions) => {
               : {}),
           },
         )
+        metrics.recordSystemOneCall(Date.now() - startedAt)
         const decision: JudgedDecision = result.ok
           ? judge(
               riskRequest(hookInput.tool, output.args),
@@ -607,6 +692,7 @@ export default (async (input, options?: PluginOptions) => {
             )
           : unavailable<JudgedVerdict>(result.failure.kind, result.failure.detail)
         const action = decidePolicy(decision, category, { blockThreshold: config.blockThreshold })
+        metrics.recordDecision(action)
         if (decision.kind === "valid" && isChoiceVerdict(decision.verdict)) {
           const verdict = decision.verdict
           await log("info", "Jev tool risk verdict", {
@@ -617,6 +703,10 @@ export default (async (input, options?: PluginOptions) => {
           // `revise` is exactly destructive + confidence > blockThreshold; the
           // throw below is the byte-identical destructive gate.
           const blocks = verdict.choice === "destructive" && verdict.confidence > config.blockThreshold
+          const message = `[jev] Blocked destructive tool "${hookInput.tool}" (confidence ${verdict.confidence.toFixed(3)} > ${config.blockThreshold}).`
+          if (logicalKey !== undefined) {
+            triggerGate.remember(logicalKey, blocks ? { blocked: true, message } : { blocked: false })
+          }
           await record(
             "tool.execute.before",
             summarizeChoice({ kind: "valid", verdict }),
@@ -624,9 +714,7 @@ export default (async (input, options?: PluginOptions) => {
             hookInput.tool,
           )
           if (blocks) {
-            throw new JevBlockError(
-              `[jev] Blocked destructive tool "${hookInput.tool}" (confidence ${verdict.confidence.toFixed(3)} > ${config.blockThreshold}).`,
-            )
+            throw new JevBlockError(message)
           }
           return
         }

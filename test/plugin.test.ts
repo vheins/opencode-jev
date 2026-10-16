@@ -134,6 +134,9 @@ beforeEach(() => {
   // Tracing is opt-in and off by default; keep it off unless a test enables it.
   delete process.env.JEV_TRACE_LOG
   delete process.env.JEV_TRACE_LOG_PATH
+  // Pin the selective-trigger cooldown so the gate tests are independent of any
+  // JEV_COOLDOWN_MS inherited from the ambient shell.
+  delete process.env.JEV_COOLDOWN_MS
 })
 
 afterEach(() => {

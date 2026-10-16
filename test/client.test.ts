@@ -45,6 +45,7 @@ function config(overrides: Partial<Config> = {}): Config {
     enableToolGate: false,
     timeoutMs: 50,
     cacheTtlMs: 60_000,
+    cooldownMs: 30_000,
     maxConcurrent: 4,
     ...overrides,
   }

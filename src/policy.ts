@@ -136,6 +136,34 @@ export function riskCacheScope(tool: string, args: unknown): string {
 }
 
 /**
+ * Derive the LOGICAL-ACTION key the selective trigger gate groups on.
+ *
+ * Two calls share a logical action only when they are a proven SAFE equivalence
+ * class, so grouping them can never collapse a genuinely different decision:
+ *
+ * - A locally-recognized destructive hint is keyed by the exact pattern it
+ *   matched (the same safe equivalence {@link riskCacheScope} already uses), so
+ *   repeated calls of one destructive pattern collapse to a single judgement
+ *   while two distinct destructive patterns stay separate.
+ * - Every other action returns `undefined`: the `unknown` class is deliberately
+ *   NOT a safe equivalence class (see {@link riskCacheScope}), so the caller
+ *   must not group it and each such action is judged on its own.
+ *
+ * `read_only` never reaches the gate (the caller skips it locally), so it also
+ * returns `undefined` here.
+ *
+ * @param tool - The tool id being invoked.
+ * @param args - The tool arguments.
+ * @returns The logical-action key, or `undefined` when the action must not be
+ *   grouped.
+ */
+export function riskLogicalKey(tool: string, args: unknown): string | undefined {
+  const local = classifyLocally(tool, args)
+  if (local.kind !== "destructive_hint") return undefined
+  return `${tool}\u0000${local.kind}:${local.reason}`
+}
+
+/**
  * Path/extension/keyword patterns that mark a file as security-sensitive, with
  * a deterministic weight in `[0, 1]`.
  *
