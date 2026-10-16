@@ -5,122 +5,85 @@
  * built-in plugin hooks. Jev is not a model replacement: it returns typed
  * answers (Choice / Score / Noul) that this plugin branches on.
  *
- * All Jev calls go through the configured router provider, which
- * exposes a pass-through route at `POST https://model.spasi.biz.id/v1/systemone`
- * (alias `/systemone`). The router forwards the body untouched and returns the
+ * All Jev calls go through the configured router provider, whose pass-through
+ * route (`POST` at `JEV_BASE_URL`) forwards the body untouched and returns the
  * native System One JSON, authenticated with the same bearer key used for chat
- * models.
+ * models. `JEV_BASE_URL` is REQUIRED: the plugin ships no default host.
  *
  * Hooks provided:
- * - `tool.execute.before`: classifies every tool call and blocks destructive
- *   actions whose confidence exceeds the block threshold.
- * - `permission.ask`: arbitrates permission prompts from Jev confidence,
- *   auto-allowing confident read-only actions and denying confident
- *   destructive ones; everything else escalates to the human unchanged.
+ * - `tool.execute.before`: classifies a tool call and blocks a destructive
+ *   action whose confidence exceeds the block threshold. It can only ever
+ *   add a block; it never auto-allows, so opencode's native permission flow
+ *   remains the sole gate for execution.
  * - `tool.jev_decide`: exposes Choice / Score / Noul judgments over arbitrary
  *   state as a callable tool.
- * - `chat.message`: cascade-routes each user message (code_only | needs_model |
- *   needs_human) and raises a toast on a confident needs_human. Never alters
- *   the message flow.
- * - `experimental.session.compacting`: scores whether the session holds
- *   unrecoverable decisions and appends a reminder line to the summary context.
- *   Never replaces the compaction prompt.
+ * - `chat.message`: classifies each user message (code_only | needs_model |
+ *   needs_human) and raises a toast on a confident needs_human. This hook is
+ *   observe-only: it cannot reroute the message, so it is reported as a
+ *   classification, never as routing.
+ * - `experimental.session.compacting`: asks whether the session holds
+ *   unrecoverable state and appends a preservation reminder to the summary
+ *   context. Never replaces the compaction prompt.
  * - `event`: handles `session.error` (severity: transient | real_bug | fatal)
  *   and `file.edited` (security-sensitive review check).
  *
- * When no JEV key is available the plugin degrades to a no-op that warns
- * once, so opencode startup never crashes. Every hook is throw-safe: a Jev
- * failure or missing key degrades to a no-op + warn and never breaks opencode's
- * flow.
+ * When the key or base URL is missing, the plugin degrades to a no-op that
+ * warns once, so opencode startup never crashes. Every hook is throw-safe: a
+ * Jev failure or missing config degrades to the safe path and never breaks
+ * opencode's flow.
  *
  * @module
  */
-
-import { readFileSync } from "node:fs"
-import { homedir } from "node:os"
-import { join } from "node:path"
 
 import type { Event } from "@opencode-ai/sdk"
 import type { Hooks, Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { choice, noul, score, type Question } from "@typesafe-ai/sdk"
 
+import { errorMessage, safeStringify, SystemOneClient } from "./client.ts"
+import { loadConfig, type DisabledReason } from "./config.ts"
+import {
+  classifyNoul,
+  classifyRisk,
+  classifyRoute,
+  classifySeverity,
+} from "./decisions.ts"
+import type { ChoiceVerdict, Decision, LogLevel, RiskLevel } from "./domain.ts"
+import {
+  classifyLocally,
+  failurePolicy,
+  type ActionCategory,
+} from "./policy.ts"
+import { parseResponse } from "./validate.ts"
+
 /** Log service name stamped on every entry this plugin emits. */
 const SERVICE = "opencode-jev"
 
-/** Router pass-through route for System One judgments. */
-const DEFAULT_BASE_URL = "https://model.spasi.biz.id/v1/systemone"
-
-/** Fallback key file written by the router provider setup. */
-const DEFAULT_KEY_FILE = join(homedir(), ".config", "opencode", ".jev-key")
-
 /**
- * Jev model id used when `JEV_MODEL` is unset.
+ * Decision-policy version.
  *
- * CONFIRMED against this deployment: POST /v1/systemone with an entitled key
- * returned HTTP 200 and `{"answers":{"is_urgent":{"type":"noul","noul":0.96}}}`.
+ * Bump this whenever decision semantics, thresholds, or question wording
+ * change so a cached decision cannot outlive the policy that produced it.
  */
-const DEFAULT_MODEL = "oc/jev-1.13-free"
+const POLICY_VERSION = "2"
 
-/** Default confidence above which a destructive verdict blocks the action. */
-const DEFAULT_BLOCK_THRESHOLD = 0.85
+/** Question id used for the security-sensitive file review. */
+const FILE_REVIEW_QUESTION_ID = "security_sensitive"
 
-/** Default confidence at or above which a read-only verdict is auto-allowed. */
-const DEFAULT_ALLOW_THRESHOLD = 0.7
+/** Instructions for the security-sensitive file review. */
+const FILE_REVIEW_INSTRUCTIONS =
+  "Is this file path security-sensitive or does it need a security review before changes are accepted?"
 
-/** Default confidence above which a cascade-routing or severity verdict surfaces a toast. */
-const DEFAULT_ALERT_THRESHOLD = 0.8
+/** Question id used for the compaction preservation check. */
+const COMPACT_QUESTION_ID = "unrecoverable"
 
-/** Default confidence at or above which a compaction reminder is appended. */
-const DEFAULT_COMPACT_THRESHOLD = 0.75
+/** Instructions for the compaction preservation check. */
+const COMPACT_INSTRUCTIONS =
+  "Does this session hold unrecoverable decisions, findings, or context that must be preserved in the summary to avoid losing work?"
 
-/** Per-request timeout (ms) for a Jev call, so a hung router never stalls a hook. */
-const REQUEST_TIMEOUT_MS = 10_000
-
-/** Risk labels and their criteria for the tool-call guardrail. */
-const RISK_CRITERIA = {
-  read_only: "The action only reads or inspects state and makes no changes.",
-  mutating:
-    "The action changes state, but the change is reversible or non-destructive.",
-  destructive:
-    "The action causes irreversible loss: delete, overwrite, force-push, drop, format, or similar.",
-} as const
-
-/** Cascade-routing labels for user messages. */
-const ROUTE_CRITERIA = {
-  code_only:
-    "The request is fully answerable by direct code reading or editing with no external judgment.",
-  needs_model:
-    "The request needs reasoning or generation from a language model, but no human decision.",
-  needs_human:
-    "The request needs a human decision, approval, private context, or is ambiguous or high-stakes.",
-} as const
-
-/** Severity labels for a session error. */
-const SEVERITY_CRITERIA = {
-  transient: "A retryable or environmental failure that will likely clear on its own.",
-  real_bug: "A genuine defect in the code or configuration that needs a fix.",
-  fatal: "A failure that blocks all further progress and requires immediate human attention.",
-} as const
-
-/** A risk level produced by the guardrail classifier. */
-type RiskLevel = keyof typeof RISK_CRITERIA
-
-/** A cascade-routing label for a user message. */
-type RouteLevel = keyof typeof ROUTE_CRITERIA
-
-/** A severity label for a session error. */
-type SeverityLevel = keyof typeof SEVERITY_CRITERIA
-
-/** A classified Choice verdict with its confidence and full distribution. */
-type ChoiceVerdict<T extends string> = {
-  choice: T
-  confidence: number
-  probabilities: Record<string, number>
-}
-
-/** A classified risk verdict. */
-type RiskVerdict = ChoiceVerdict<RiskLevel>
+/** The preservation reminder appended to the compaction context. */
+const COMPACT_REMINDER =
+  "[jev] This session likely holds unrecoverable state. Preserve explicitly: decisions, constraints, unresolved issues, file references, test status, and next actions."
 
 /**
  * Error thrown to block a destructive tool call.
@@ -130,126 +93,15 @@ type RiskVerdict = ChoiceVerdict<RiskLevel>
  */
 class JevBlockError extends Error {}
 
-/** A yes/no answer as returned by the router. */
-type NoulAnswer = { type: "noul"; noul: number }
-
-/** A selected-label answer as returned by the router. */
-type ChoiceAnswer = {
-  type: "choice"
-  choice: string
-  confidence: number
-  probabilities: Record<string, number>
-}
-
-/** A scored answer as returned by the router. */
-type ScoreAnswer = {
-  type: "score"
-  score: number
-  confidence: number
-  legend: Record<string, unknown>
-  probabilities: Record<string, number>
-}
-
-/** Any System One answer. */
-type Answer = NoulAnswer | ChoiceAnswer | ScoreAnswer
-
-/** The native System One response envelope. */
-type SystemOneResponse = {
-  model: string
-  answers: Record<string, Answer>
-  usage: { input_tokens: number; output_tokens: number }
-}
-
-/**
- * Parse a numeric threshold from an environment value.
- *
- * @param raw - Raw environment string, or `undefined` when unset.
- * @param fallback - Value returned when the input is missing or not finite.
- * @returns The parsed threshold, or `fallback`.
- */
-function parseThreshold(raw: string | undefined, fallback: number): number {
-  if (raw === undefined || raw.trim() === "") return fallback
-  const parsed = Number(raw)
-  return Number.isFinite(parsed) ? parsed : fallback
-}
-
-/**
- * Validate a remote verdict before it is trusted for an allow/deny decision.
- *
- * Rejects unknown labels (when an allowlist is given) and non-finite or
- * out-of-range confidence values, so a malformed remote answer degrades to the
- * no-op path instead of driving a block/allow or a `toFixed` throw.
- *
- * @param choice - The remote label; checked against `allowed` when provided.
- * @param confidence - The remote confidence/probability.
- * @param allowed - Optional set of labels the question may legitimately return.
- * @returns True when the verdict is well-formed.
- */
-function isValidVerdict(
-  choice: unknown,
-  confidence: unknown,
-  allowed?: readonly string[],
-): boolean {
-  if (
-    typeof confidence !== "number" ||
-    !Number.isFinite(confidence) ||
-    confidence < 0 ||
-    confidence > 1
-  ) {
-    return false
+/** Human-readable description of why Jev is disabled. */
+function disabledMessage(reason: DisabledReason): string {
+  if (reason === "missing-key") {
+    return "No JEV key found (JEV_API_KEY or .jev-key); Jev guardrails are a no-op."
   }
-  if (allowed !== undefined && (typeof choice !== "string" || !allowed.includes(choice))) {
-    return false
-  }
-  return true
+  return "JEV_BASE_URL is not set; Jev guardrails are a no-op (no default host is used)."
 }
 
-/**
- * Serialize an arbitrary value to JSON without throwing on cycles or bigints.
- *
- * @param value - Value to serialize.
- * @returns A JSON string, or a stringified fallback when serialization fails.
- */
-function safeStringify(value: unknown): string {
-  try {
-    return JSON.stringify(value, (_key, inner) =>
-      typeof inner === "bigint" ? inner.toString() : inner,
-    )
-  } catch {
-    return String(value)
-  }
-}
-
-/**
- * Reduce an unknown thrown value to a readable message.
- *
- * @param error - The caught value.
- * @returns A human-readable message.
- */
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
-}
-
-/**
- * Cap a serialized state string so no Jev request body grows unbounded.
- *
- * Values at or under the cap pass through byte-identical.
- *
- * @param value - The serialized state string.
- * @param max - Maximum character count; defaults to 4000.
- * @returns The original string when within the cap, otherwise a truncated slice.
- */
-function truncateState(value: string, max = 4000): string {
-  return value.length > max ? value.slice(0, max) : value
-}
-
-/**
- * Extract the concatenated text of a message's parts, bounded in length.
- *
- * @param parts - Message parts; only text parts contribute.
- * @returns The joined text, trimmed to a bounded length.
- */
+/** Extract the concatenated text of a message's parts, bounded in length. */
 function extractText(parts: ReadonlyArray<{ type?: string; text?: string }>): string {
   const text = parts
     .filter((part) => part.type === "text" && typeof part.text === "string")
@@ -259,19 +111,36 @@ function extractText(parts: ReadonlyArray<{ type?: string; text?: string }>): st
   return text.length > 4000 ? text.slice(0, 4000) : text
 }
 
-/**
- * Resolve the JEV API key from the environment, then the provider key file.
- *
- * @returns The trimmed key, or `undefined` when neither source yields one.
- */
-function resolveApiKey(): string | undefined {
-  const fromEnv = process.env.JEV_API_KEY?.trim()
-  if (fromEnv) return fromEnv
-  try {
-    const fromFile = readFileSync(DEFAULT_KEY_FILE, "utf8").trim()
-    return fromFile || undefined
-  } catch {
-    return undefined
+/** A bounded set of warning keys already emitted, to avoid log spam. */
+class WarnOnce {
+  private readonly seen = new Set<string>()
+
+  /**
+   * @param key - The warning key.
+   * @returns True the first time a key is seen, false afterwards.
+   */
+  claim(key: string): boolean {
+    if (this.seen.has(key)) return false
+    if (this.seen.size >= 128) this.seen.clear()
+    this.seen.add(key)
+    return true
+  }
+}
+
+/** A validated tool-risk decision outcome. */
+type RiskDecision = Decision<ChoiceVerdict<RiskLevel>>
+
+/** Describe a non-actionable decision for logging. */
+function describeDecision(decision: RiskDecision): string {
+  switch (decision.kind) {
+    case "invalid":
+      return `invalid:${decision.reason}`
+    case "unavailable":
+      return `unavailable:${decision.reason}`
+    case "abstain":
+      return `abstain:${decision.confidence.toFixed(2)}`
+    case "valid":
+      return `valid:${decision.verdict.choice}:${decision.verdict.confidence.toFixed(2)}`
   }
 }
 
@@ -283,10 +152,10 @@ export default (async (input) => {
    *
    * @param level - Log level.
    * @param message - Log message.
-   * @param extra - Optional structured metadata.
+   * @param extra - Optional structured metadata (never secrets).
    */
   const log = async (
-    level: "debug" | "info" | "warn" | "error",
+    level: LogLevel,
     message: string,
     extra?: Record<string, unknown>,
   ): Promise<void> => {
@@ -310,209 +179,45 @@ export default (async (input) => {
     title?: string,
   ): Promise<void> => {
     try {
-      await client.tui.showToast({
-        body: { message, variant, title, duration: 5000 },
-      })
+      await client.tui.showToast({ body: { message, variant, title, duration: 5000 } })
     } catch {
       // A toast failure must never break a hook.
     }
   }
 
-  const apiKey = resolveApiKey()
-  const baseUrl = process.env.JEV_BASE_URL?.trim() || DEFAULT_BASE_URL
-  const model = process.env.JEV_MODEL?.trim() || DEFAULT_MODEL
-  const blockThreshold = parseThreshold(
-    process.env.JEV_BLOCK_THRESHOLD,
-    DEFAULT_BLOCK_THRESHOLD,
-  )
-  const allowThreshold = parseThreshold(
-    process.env.JEV_ALLOW_THRESHOLD,
-    DEFAULT_ALLOW_THRESHOLD,
-  )
-  const alertThreshold = parseThreshold(
-    process.env.JEV_ROUTE_THRESHOLD,
-    DEFAULT_ALERT_THRESHOLD,
-  )
-  const severityThreshold = parseThreshold(
-    process.env.JEV_SEVERITY_THRESHOLD,
-    DEFAULT_ALERT_THRESHOLD,
-  )
-  const compactThreshold = parseThreshold(
-    process.env.JEV_COMPACT_THRESHOLD,
-    DEFAULT_COMPACT_THRESHOLD,
-  )
+  const { config, disabledReason } = loadConfig()
+  const warnOnce = new WarnOnce()
+  const systemOne = new SystemOneClient(config, POLICY_VERSION)
 
-  if (apiKey) {
-    await log("info", "Jev router configured", { baseUrl, model })
+  if (disabledReason) {
+    await log("warn", disabledMessage(disabledReason))
   } else {
-    await log(
-      "warn",
-      "No JEV key found (JEV_API_KEY or .jev-key); Jev guardrails are a no-op.",
-    )
+    await log("info", "Jev router configured", { baseUrl: config.baseUrl, model: config.model })
   }
 
   /**
-   * POST a System One request through the router pass-through route.
+   * Report an unavailable/invalid verdict for a high-impact action.
    *
-   * The router forwards the body untouched and returns native System One JSON,
-   * so a raw fetch is used instead of the SDK client to keep the wire contract
-   * exact for a custom base URL.
+   * The plugin never auto-allows, so this is a warning only: opencode's native
+   * permission flow still gates the action.
    *
-   * @param state - State to evaluate (serialized when not a string).
-   * @param questions - Named questions keyed by the ids used to read answers.
-   * @param override - Optional model override for this call.
-   * @returns The native System One response.
-   * @throws {Error} When no key is configured, the transport fails, or the
-   * router returns a non-2xx status.
+   * @param label - A short label naming the action.
+   * @param category - The action category.
+   * @param decision - The non-actionable decision.
    */
-  const systemOne = async (
-    state: string,
-    questions: Record<string, Question>,
-    override?: string,
-  ): Promise<SystemOneResponse> => {
-    if (!apiKey) {
-      throw new Error("No JEV key configured")
-    }
-    const boundedState = truncateState(state)
-    const response = await fetch(baseUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: override?.trim() || model,
-        state: boundedState,
-        questions,
-      }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    })
-    if (!response.ok) {
-      const detail = await response.text().catch(() => "")
-      throw new Error(
-        `systemone HTTP ${response.status}: ${detail.slice(0, 500)}`,
-      )
-    }
-    return (await response.json()) as SystemOneResponse
-  }
-
-  /**
-   * Classify the risk of an action using a Jev Choice question.
-   *
-   * @param state - The action description or structured state to classify.
-   * @returns The verdict, or `undefined` when Jev is disabled or fails.
-   */
-  const classifyRisk = async (state: unknown): Promise<RiskVerdict | undefined> => {
-    if (!apiKey) return undefined
-    try {
-      const { answers } = await systemOne(safeStringify(state), {
-        risk: choice(
-          "Classify the risk of the following agent action. Choose read_only if it only inspects state, mutating if it changes state reversibly, destructive if it causes irreversible loss such as delete, overwrite, force-push, drop, or format.",
-          RISK_CRITERIA,
-        ),
-      })
-      const answer = answers.risk
-      if (!answer || answer.type !== "choice") return undefined
-      if (!isValidVerdict(answer.choice, answer.confidence, Object.keys(RISK_CRITERIA))) {
-        await log("warn", "Jev risk verdict malformed; ignoring", {
-          choice: answer.choice,
-          confidence: answer.confidence,
-        })
-        return undefined
-      }
-      return {
-        choice: answer.choice as RiskLevel,
-        confidence: answer.confidence,
-        probabilities: answer.probabilities,
-      }
-    } catch (error) {
-      await log("warn", "Jev risk classification failed", {
-        error: errorMessage(error),
-      })
-      return undefined
-    }
-  }
-
-  /**
-   * Classify arbitrary state into one of a set of named labels using a Jev
-   * Choice question.
-   *
-   * @param label - Question id used to read the answer.
-   * @param instructions - The question text.
-   * @param criteria - Map of label to description (at least two entries).
-   * @param state - The state to classify (serialized when not a string).
-   * @returns The verdict, or `undefined` when Jev is disabled or fails.
-   */
-  const classifyChoice = async (
+  const reportUnavailable = async (
     label: string,
-    instructions: string,
-    criteria: Record<string, string>,
-    state: unknown,
-  ): Promise<ChoiceVerdict<string> | undefined> => {
-    if (!apiKey) return undefined
-    try {
-      const { answers } = await systemOne(safeStringify(state), {
-        [label]: choice(instructions, criteria),
-      })
-      const answer = answers[label]
-      if (!answer || answer.type !== "choice") return undefined
-      if (!isValidVerdict(answer.choice, answer.confidence, Object.keys(criteria))) {
-        await log("warn", "Jev verdict malformed; ignoring", {
-          label,
-          choice: answer.choice,
-          confidence: answer.confidence,
-        })
-        return undefined
-      }
-      return {
-        choice: answer.choice,
-        confidence: answer.confidence,
-        probabilities: answer.probabilities,
-      }
-    } catch (error) {
-      await log("warn", "Jev classification failed", {
+    category: ActionCategory,
+    decision: RiskDecision,
+  ): Promise<void> => {
+    const policy = failurePolicy(category)
+    const detail = describeDecision(decision)
+    if (policy === "warn" && warnOnce.claim(`${label}:${detail}`)) {
+      await log("warn", "Jev could not produce an actionable verdict for a high-impact action", {
         label,
-        error: errorMessage(error),
+        category,
+        detail,
       })
-      return undefined
-    }
-  }
-
-  /**
-   * Ask a single Jev Noul (yes/no) question about state.
-   *
-   * @param label - Question id used to read the answer.
-   * @param instructions - The question text.
-   * @param state - The state to evaluate (serialized when not a string).
-   * @returns The probability of "yes" (0..1), or `undefined` when Jev is
-   * disabled or fails.
-   */
-  const classifyNoul = async (
-    label: string,
-    instructions: string,
-    state: unknown,
-  ): Promise<number | undefined> => {
-    if (!apiKey) return undefined
-    try {
-      const { answers } = await systemOne(safeStringify(state), {
-        [label]: noul(instructions),
-      })
-      const answer = answers[label]
-      if (!answer || answer.type !== "noul") return undefined
-      if (!isValidVerdict(undefined, answer.noul)) {
-        await log("warn", "Jev noul verdict malformed; ignoring", {
-          label,
-          noul: answer.noul,
-        })
-        return undefined
-      }
-      return answer.noul
-    } catch (error) {
-      await log("warn", "Jev noul judgment failed", {
-        label,
-        error: errorMessage(error),
-      })
-      return undefined
     }
   }
 
@@ -520,15 +225,9 @@ export default (async (input) => {
     description:
       "Ask TypeSafe Jev (System One) a structured judgment about arbitrary state, routed through the router provider. Supports choice, score, and noul question types and returns the typed answer as JSON.",
     args: {
-      state: tool.schema
-        .string()
-        .describe("The text or JSON state to evaluate."),
-      type: tool.schema
-        .enum(["choice", "score", "noul"])
-        .describe("Question type to ask."),
-      instructions: tool.schema
-        .string()
-        .describe("The question asked about the state."),
+      state: tool.schema.string().describe("The text or JSON state to evaluate."),
+      type: tool.schema.enum(["choice", "score", "noul"]).describe("Question type to ask."),
+      instructions: tool.schema.string().describe("The question asked about the state."),
       choiceCriteria: tool.schema
         .record(tool.schema.string(), tool.schema.string())
         .optional()
@@ -550,52 +249,40 @@ export default (async (input) => {
         .describe("Optional Jev model override (defaults to JEV_MODEL)."),
     },
     async execute(args) {
-      if (!apiKey) {
-        return "Jev is disabled: no JEV key found (JEV_API_KEY or .jev-key). Set it and restart opencode to enable jev_decide."
+      if (!config.enabled) {
+        return disabledMessage(disabledReason ?? "missing-base-url")
       }
-      try {
-        const questions = (() => {
-          if (args.type === "choice") {
-            if (!args.choiceCriteria || Object.keys(args.choiceCriteria).length < 2) {
-              return undefined
-            }
-            return { judgment: choice(args.instructions, args.choiceCriteria) }
-          }
-          if (args.type === "score") {
-            if (!args.scoreCriteria || args.scoreCriteria.length < 2) {
-              return undefined
-            }
-            return {
-              judgment: score(
-                args.instructions,
-                args.scoreCriteria as [string, string, ...string[]],
-              ),
-            }
-          }
-          return {
-            judgment: noul(args.instructions, args.noulCriteria ?? undefined),
-          }
-        })()
-
-        if (!questions) {
-          return `type=${args.type} requires at least two criteria entries.`
+      const questions: Record<string, Question> | undefined = (() => {
+        if (args.type === "choice") {
+          if (!args.choiceCriteria || Object.keys(args.choiceCriteria).length < 2) return undefined
+          return { judgment: choice(args.instructions, args.choiceCriteria) }
         }
+        if (args.type === "score") {
+          if (!args.scoreCriteria || args.scoreCriteria.length < 2) return undefined
+          return {
+            judgment: score(args.instructions, args.scoreCriteria as [string, string, ...string[]]),
+          }
+        }
+        return { judgment: noul(args.instructions, args.noulCriteria ?? undefined) }
+      })()
+      if (!questions) return `type=${args.type} requires at least two criteria entries.`
 
-        const result = await systemOne(args.state, questions, args.model)
-        await log("info", "jev_decide completed", {
-          type: args.type,
-          model: result.model,
-        })
-        return safeStringify({
-          model: result.model,
-          answer: result.answers.judgment,
-          usage: result.usage,
-        })
-      } catch (error) {
-        const message = errorMessage(error)
-        await log("error", "jev_decide failed", { error: message })
-        return `jev_decide failed: ${message}`
+      const result = await systemOne.request(args.state, questions, args.model)
+      if (!result.ok) {
+        await log("error", "jev_decide failed", { type: args.type, failure: result.failure.kind })
+        return `jev_decide failed: ${result.failure.kind}`
       }
+      const parsed = parseResponse(result.body)
+      if (!parsed) {
+        await log("error", "jev_decide failed", { type: args.type, failure: "malformed" })
+        return "jev_decide failed: malformed response"
+      }
+      await log("info", "jev_decide completed", { type: args.type, model: parsed.model })
+      return safeStringify({
+        model: parsed.model,
+        answer: parsed.answers.judgment,
+        usage: parsed.usage,
+      })
     },
   })
 
@@ -604,132 +291,113 @@ export default (async (input) => {
       jev_decide: jevDecide,
     },
     "tool.execute.before": async (hookInput, output) => {
-      if (!apiKey) return
+      if (!config.enabled) return
+      const local = classifyLocally(hookInput.tool, output.args)
+      if (local.kind === "read_only") return
       try {
-        const verdict = await classifyRisk({
+        const decision = await classifyRisk(systemOne, {
           tool: hookInput.tool,
           args: output.args,
+          localSignal: local.kind === "destructive_hint" ? local.reason : undefined,
         })
-        if (!verdict) return
-        await log("info", "Jev tool risk verdict", {
-          tool: hookInput.tool,
-          choice: verdict.choice,
-          confidence: verdict.confidence,
-        })
-        if (verdict.choice === "destructive" && verdict.confidence > blockThreshold) {
-          throw new JevBlockError(
-            `[jev] Blocked destructive tool "${hookInput.tool}" (confidence ${verdict.confidence.toFixed(3)} > ${blockThreshold}).`,
-          )
+        if (decision.kind === "valid") {
+          await log("info", "Jev tool risk verdict", {
+            tool: hookInput.tool,
+            choice: decision.verdict.choice,
+            confidence: decision.verdict.confidence,
+          })
+          if (
+            decision.verdict.choice === "destructive" &&
+            decision.verdict.confidence > config.blockThreshold
+          ) {
+            throw new JevBlockError(
+              `[jev] Blocked destructive tool "${hookInput.tool}" (confidence ${decision.verdict.confidence.toFixed(3)} > ${config.blockThreshold}).`,
+            )
+          }
+          return
         }
+        // Non-actionable: never relax the native gate. Warn only for the
+        // category the local pre-classification (or Jev's own history) marks
+        // high-impact, and only for invalid/unavailable or a destructive hint.
+        const category: ActionCategory =
+          local.kind === "destructive_hint" ? "destructive" : "reversible"
+        const warnWorthy =
+          decision.kind === "invalid" ||
+          decision.kind === "unavailable" ||
+          (decision.kind === "abstain" && local.kind === "destructive_hint")
+        if (warnWorthy) await reportUnavailable(hookInput.tool, category, decision)
       } catch (error) {
-        // An intentional block must still propagate; anything else degrades to a no-op.
         if (error instanceof JevBlockError) throw error
         await log("warn", "Jev tool guard failed", { error: errorMessage(error) })
       }
     },
-    "permission.ask": async (permission, output) => {
-      if (!apiKey) return
-      try {
-        const verdict = await classifyRisk({
-          permission: permission.type,
-          pattern: permission.pattern,
-          title: permission.title,
-        })
-        if (!verdict) return
-        await log("info", "Jev permission verdict", {
-          permission: permission.type,
-          choice: verdict.choice,
-          confidence: verdict.confidence,
-        })
-        if (verdict.choice === "read_only" && verdict.confidence >= allowThreshold) {
-          output.status = "allow"
-        } else if (
-          verdict.choice === "destructive" &&
-          verdict.confidence > blockThreshold
-        ) {
-          output.status = "deny"
-        }
-        // Otherwise leave the status untouched: opencode escalates to the human.
-      } catch (error) {
-        await log("warn", "Jev permission arbitration failed", {
-          error: errorMessage(error),
-        })
-      }
-    },
     "chat.message": async (_hookInput, output) => {
-      if (!apiKey) return
+      if (!config.enabled) return
       try {
         const text = extractText(output.parts)
         if (!text) return
-        const verdict = await classifyChoice(
-          "route",
-          "Cascade-route this user message. Choose code_only if it is fully answerable by reading or editing code with no external judgment, needs_model if it needs language-model reasoning but no human decision, or needs_human if it needs a human decision, approval, private context, or is ambiguous or high-stakes.",
-          ROUTE_CRITERIA,
-          { message: text },
-        )
-        if (!verdict) return
-        await log("info", "Jev cascade routing verdict", {
-          route: verdict.choice,
-          confidence: verdict.confidence,
+        const decision = await classifyRoute(systemOne, { message: text })
+        if (decision.kind !== "valid") return
+        await log("info", "Jev cascade classification (observe-only)", {
+          route: decision.verdict.choice,
+          confidence: decision.verdict.confidence,
         })
-        if (verdict.choice === "needs_human" && verdict.confidence >= alertThreshold) {
+        if (
+          decision.verdict.choice === "needs_human" &&
+          decision.verdict.confidence >= config.routeThreshold
+        ) {
           await toast(
-            `Message routed to needs_human (confidence ${verdict.confidence.toFixed(2)}).`,
+            `Message classified needs_human (confidence ${decision.verdict.confidence.toFixed(2)}).`,
             "warning",
-            "Jev cascade routing",
+            "Jev cascade classification",
           )
         }
       } catch (error) {
-        await log("warn", "Jev cascade routing failed", {
-          error: errorMessage(error),
-        })
+        await log("warn", "Jev cascade classification failed", { error: errorMessage(error) })
       }
     },
     "experimental.session.compacting": async (_hookInput, output) => {
-      if (!apiKey) return
+      if (!config.enabled) return
       try {
-        const probability = await classifyNoul(
-          "unrecoverable",
-          "Does this session hold unrecoverable decisions, findings, or context that must be preserved in the summary to avoid losing work?",
+        const decision = await classifyNoul(
+          systemOne,
+          COMPACT_QUESTION_ID,
+          COMPACT_INSTRUCTIONS,
           { context: output.context },
         )
-        if (probability === undefined) return
-        await log("info", "Jev compaction judgment", { probability })
-        if (probability >= compactThreshold) {
-          output.context.push(
-            "[jev] This session likely holds unrecoverable decisions; preserve decisions, findings, and next steps explicitly.",
-          )
+        if (decision.kind !== "valid") return
+        await log("info", "Jev compaction judgment", { probability: decision.verdict })
+        if (decision.verdict >= config.compactThreshold) {
+          output.context.push(COMPACT_REMINDER)
         }
       } catch (error) {
-        await log("warn", "Jev compaction judgment failed", {
-          error: errorMessage(error),
-        })
+        await log("warn", "Jev compaction judgment failed", { error: errorMessage(error) })
       }
     },
     event: async (hookInput) => {
-      if (!apiKey) return
+      if (!config.enabled) return
       try {
         const event = hookInput.event as Event
         switch (event.type) {
           case "session.error": {
-            const severity = await classifyChoice(
-              "severity",
-              "Classify the severity of this opencode session error. Choose transient if it is retryable or environmental, real_bug if it is a genuine defect needing a fix, or fatal if it blocks all further progress and needs immediate human attention.",
-              SEVERITY_CRITERIA,
-              { error: event.properties.error, sessionID: event.properties.sessionID },
-            )
-            if (!severity) return
+            const error = event.properties.error
+            if (!error || error.name === "MessageAbortedError") return
+            const severity = await classifySeverity(systemOne, {
+              error,
+              sessionID: event.properties.sessionID,
+            })
+            if (severity.kind !== "valid") return
             await log("warn", "Jev session error severity", {
-              severity: severity.choice,
-              confidence: severity.confidence,
+              severity: severity.verdict.choice,
+              confidence: severity.verdict.confidence,
             })
             if (
-              severity.choice !== "transient" &&
-              severity.confidence >= severityThreshold
+              severity.verdict.choice !== "transient" &&
+              severity.verdict.confidence >= config.severityThreshold
             ) {
               await toast(
-                `Session error classified ${severity.choice} (confidence ${severity.confidence.toFixed(2)}).`,
-                severity.choice === "fatal" ? "error" : "warning",
+                `Session error classified ${severity.verdict.choice} (confidence ${severity.verdict.confidence.toFixed(2)}).`,
+                severity.verdict.choice === "fatal" ? "error" : "warning",
                 "Jev error triage",
               )
             }
@@ -737,22 +405,19 @@ export default (async (input) => {
           }
           case "file.edited": {
             const file = event.properties.file
-            const probability = await classifyNoul(
-              "security_sensitive",
-              "Is this file path security-sensitive or does it need a security review before changes are accepted?",
+            const decision = await classifyNoul(
+              systemOne,
+              FILE_REVIEW_QUESTION_ID,
+              FILE_REVIEW_INSTRUCTIONS,
               { file },
             )
-            if (probability === undefined) return
+            if (decision.kind !== "valid") return
             await log("info", "Jev file edit review judgment", {
               file,
-              probability,
+              probability: decision.verdict,
             })
-            if (probability >= alertThreshold) {
-              await toast(
-                `Security-sensitive file edited: ${file}`,
-                "warning",
-                "Jev file review",
-              )
+            if (decision.verdict >= config.fileReviewThreshold) {
+              await toast(`Security-sensitive file edited: ${file}`, "warning", "Jev file review")
             }
             return
           }
@@ -760,9 +425,7 @@ export default (async (input) => {
             return
         }
       } catch (error) {
-        await log("warn", "Jev event handler failed", {
-          error: errorMessage(error),
-        })
+        await log("warn", "Jev event handler failed", { error: errorMessage(error) })
       }
     },
   } satisfies Hooks
