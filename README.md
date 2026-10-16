@@ -66,6 +66,26 @@ Add the package to your opencode config (`opencode.json`):
 
 opencode installs the plugin with Bun at startup and caches it under `~/.cache/opencode/`. Then set the JEV key and base URL (see [Configuration](#configuration)) and restart opencode.
 
+To configure the plugin inline instead of via environment variables, use the **tuple form** and pass an options object as the second array element:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "@vheins/opencode-system-one",
+      {
+        "baseUrl": "https://your-router.example/v1/systemone",
+        "model": "oc/jev-1.13-free",
+        "blockThreshold": 0.85
+      }
+    ]
+  ]
+}
+```
+
+The object form `{"package": "...", "options": {...}}` is **not** supported by opencode 1.19.0 (it is dropped by the v1/v2 compatibility layer), and a custom top-level `opencode.json` key is silently stripped. Only the tuple form delivers options to the plugin.
+
 ### From source
 
 Clone this repository (or copy **both** the `.opencode/` directory **and** the root `src/` directory, preserving their relative layout). The local plugin entry `.opencode/plugins/jev.ts` is a thin re-export of `../../src/index`, so `src/` must sit beside `.opencode/`:
@@ -90,22 +110,32 @@ Then restart opencode (config and plugins load at startup).
 
 ## Configuration
 
-Copy `.opencode/.env.example` to `.env` (or export the variables in your shell). The JEV key and the base URL are both required; if either is unset the guardrails degrade to a no-op that warns once.
+Every value can be supplied three ways. Resolution precedence, highest first:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `JEV_API_KEY` | — | Bearer key for the router provider. If unset, the plugin falls back to `~/.config/opencode/.jev-key`, then no-ops with a warning. |
-| `JEV_BASE_URL` | — (required) | Router pass-through route for System One judgments. **No default host is shipped**; an unset or blank value disables Jev (no-op + warn) rather than calling any host. |
-| `JEV_MODEL` | `oc/jev-1.13-free` | Jev model id. |
-| `JEV_BLOCK_THRESHOLD` | `0.85` | Block a destructive tool call when confidence exceeds this value. |
-| `JEV_ROUTE_THRESHOLD` | `0.8` | Toast when `chat.message` classifies a message as `needs_human` at or above this confidence. |
-| `JEV_SEVERITY_THRESHOLD` | `0.8` | Toast when a `session.error` severity resolves to `real_bug`/`fatal` at or above this confidence. |
-| `JEV_COMPACT_THRESHOLD` | `0.75` | Append a preservation reminder to compaction context at or above this probability. |
-| `JEV_FILE_REVIEW_THRESHOLD` | `0.8` | Toast when an edited file is judged security-sensitive at or above this probability. |
+1. **opencode.json plugin options** (the tuple form above), camelCase keys.
+2. **Environment variables** (`JEV_*`), exported in your shell or a `.env`.
+3. **The key file** `~/.config/opencode/.jev-key` (for the API key only).
 
-Thresholds are per category; there is no single global threshold across unrelated decisions. A value outside `[0, 1]` is ignored and the default is used, so a typo cannot widen a guardrail silently.
+The JEV key and the base URL are both required; if neither source supplies one, the guardrails degrade to a no-op that warns once.
 
-Key resolution order: `JEV_API_KEY` environment variable, then the file `~/.config/opencode/.jev-key`. **Never commit a real key.** The repository ignores `.env`, `*.key`, and similar files.
+| Option (opencode.json) | Environment variable | Default | Purpose |
+| --- | --- | --- | --- |
+| `apiKey` | `JEV_API_KEY` | — | Bearer key for the router provider. If unset, the plugin falls back to `~/.config/opencode/.jev-key`, then no-ops with a warning. |
+| `baseUrl` | `JEV_BASE_URL` | — (required) | Router pass-through route for System One judgments. **No default host is shipped**; an unset or blank value disables Jev (no-op + warn) rather than calling any host. |
+| `model` | `JEV_MODEL` | `oc/jev-1.13-free` | Jev model id. |
+| `blockThreshold` | `JEV_BLOCK_THRESHOLD` | `0.85` | Block a destructive tool call when confidence exceeds this value. |
+| `routeThreshold` | `JEV_ROUTE_THRESHOLD` | `0.8` | Toast when `chat.message` classifies a message as `needs_human` at or above this confidence. |
+| `severityThreshold` | `JEV_SEVERITY_THRESHOLD` | `0.8` | Toast when a `session.error` severity resolves to `real_bug`/`fatal` at or above this confidence. |
+| `compactThreshold` | `JEV_COMPACT_THRESHOLD` | `0.75` | Append a preservation reminder to compaction context at or above this probability. |
+| `fileReviewThreshold` | `JEV_FILE_REVIEW_THRESHOLD` | `0.8` | Toast when an edited file is judged security-sensitive at or above this probability. |
+
+Thresholds are per category; there is no single global threshold across unrelated decisions. A value outside `[0, 1]` is ignored and the default is used, so a typo cannot widen a guardrail silently. A wrong-typed option is likewise ignored (the environment value then applies) and logs a one-time warning naming the field, never its value.
+
+### Security: prefer env or the key file for the secret
+
+`opencode.json` is often committed to a repository. Putting `apiKey` there risks leaking the secret with the config file. Prefer `JEV_API_KEY` in your shell or `~/.config/opencode/.jev-key` for the key, and reserve the options object for non-secret settings (`baseUrl`, `model`, thresholds). An option-supplied key is never written to a log line.
+
+Key resolution order: the `apiKey` option, then the `JEV_API_KEY` environment variable, then the file `~/.config/opencode/.jev-key`. **Never commit a real key.** The repository ignores `.env`, `*.key`, and similar files.
 
 ## Hook / event map
 
