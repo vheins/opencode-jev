@@ -8,7 +8,9 @@ All Jev calls go through the configured router provider, which exposes a pass-th
 
 ## How it works
 
-The plugin sits between opencode events and the configured router provider. Each hook sends state plus a named question, receives a typed verdict, then branches. Every answer is validated before it is used; a missing key, missing base URL, timeout, transport error, or malformed verdict is reported as an explicit `invalid`/`unavailable` outcome rather than being treated as permission to proceed.
+The plugin sits between opencode events and the configured router provider. Each hook sends state plus a named question, receives a typed verdict, then branches. Every answer is validated **per type** (a choice label drawn from its criteria, a noul probability, a score within its rubric) before it is used; a missing key, missing base URL, timeout, transport error, or out-of-contract answer is reported as an explicit `invalid`/`unavailable` outcome rather than being treated as permission to proceed.
+
+Judgement is **on-demand**: the agent consults `tool.jev_decide` for consequential, hard-to-reverse decisions. The automatic `tool.execute.before` risk gate is **off by default** (enable with `enableToolGate` / `JEV_TOOL_GATE`), so a default install adds no per-tool-call latency and opencode's native permission flow is the sole gate for execution.
 
 The plugin can only ever **add a block** to a tool call. It never auto-allows, so opencode's native approval flow remains the sole gate for execution.
 
@@ -144,6 +146,7 @@ The JEV key and the base URL are both required; if neither source supplies one, 
 | `traceLogMaxBytes` | `JEV_TRACE_LOG_MAX_BYTES` | `1000000` | Rotate the trace log once it reaches this many bytes. |
 | `traceLogBackups` | `JEV_TRACE_LOG_BACKUPS` | `3` | Number of rotated trace-log copies to keep. |
 | `toastDecisions` | `JEV_TOAST_DECISIONS` | `false` | Toast **every** decision (not just the three default toasts). |
+| `enableToolGate` | `JEV_TOOL_GATE` | `false` | Run the automatic `tool.execute.before` risk gate. **Off by default**: judgement is on-demand via `tool.jev_decide`, and opencode's native permission flow is the sole gate for tool calls. Enable to restore the automatic destructive-tool block. |
 
 Thresholds are per category; there is no single global threshold across unrelated decisions. A value outside `[0, 1]` is ignored and the default is used, so a typo cannot widen a guardrail silently. A wrong-typed option is likewise ignored (the environment value then applies) and logs a one-time warning naming the field, never its value. The decision-log fields are validated the same way: `decisionLogMaxBytes` and `decisionLogBackups` must be non-negative integers, and `toastDecisions` must be a boolean. `timeoutMs` must be a positive integer; a non-positive or non-integer value is ignored and warned.
 
@@ -175,12 +178,18 @@ Key resolution order: the `apiKey` option, then the `JEV_API_KEY` environment va
 
 | Hook or event | Jev question | Behavior |
 | --- | --- | --- |
-| `tool.execute.before` | Choice: `read_only` \| `mutating` \| `destructive` | Blocks (throws) when the verdict is `destructive` and confidence > `JEV_BLOCK_THRESHOLD`. Low-risk tools skip the call: the read-only set (`read`, `list`, `glob`, `grep`, `todoread`, `webfetch`) plus the meta tools `todowrite` and `task-read`. The dispatch tool `task` and every mutating tool (`edit`, `write`, `bash`, `execute`, `memory-write`) stay on the network path. Runs on a tight budget: no retry, so worst-case blocking latency is one `timeoutMs` (~3s). It never auto-allows; opencode's native flow still decides everything else. |
+| `tool.execute.before` | Choice: `read_only` \| `mutating` \| `destructive` | **OFF by default.** When enabled (`enableToolGate` / `JEV_TOOL_GATE`), it blocks (throws) when the verdict is `destructive` and confidence > `JEV_BLOCK_THRESHOLD`. Low-risk tools skip the call: the read-only set (`read`, `list`, `glob`, `grep`, `todoread`, `webfetch`) plus the meta tools `todowrite` and `task-read`. The dispatch tool `task` and every mutating tool (`edit`, `write`, `bash`, `execute`, `memory-write`) stay on the network path. Runs on a tight budget: no retry, so worst-case blocking latency is one `timeoutMs` (~3s). It never auto-allows; opencode's native flow still decides everything else. |
 | `chat.message` | Deterministic local score | Scores each user message for high-stakes signals (destructive verbs on production data, secrets, approvals, migrations) with **no Jev call**. Raises a TUI toast when the score reaches `JEV_ROUTE_THRESHOLD`. This hook is **observe-only**: it cannot reroute the message. |
 | `experimental.session.compacting` | Noul: "does this session hold unrecoverable decisions?" | Pushes a preservation reminder line into the summary context when the probability is high. Never replaces the compaction prompt. |
 | `event` → `session.error` | Choice: `transient` \| `real_bug` \| `fatal` | Logs the severity; raises a toast on a confident non-transient verdict. A `MessageAbortedError` is ignored. |
 | `event` → `file.edited` | Deterministic local path check | Scores the edited path for security-sensitive patterns (`.env`, key material, CI auth) with **no Jev call**, and raises a review toast when the score reaches `JEV_FILE_REVIEW_THRESHOLD`. |
-| `tool.jev_decide` (custom tool) | Choice / Score / Noul over arbitrary state | Exposes Jev directly to the agent; returns the typed answer as JSON. |
+| `tool.jev_decide` (custom tool) | Choice / Score / Noul over arbitrary state | The primary, on-demand judgement path. Exposes Jev directly to the agent; validates the answer per type and returns the typed answer as JSON. |
+
+### When to consult `jev_decide`
+
+Consult `jev_decide` for **consequential, hard-to-reverse decisions with two or more viable options** (a destructive migration, an irreversible data change, a long-lived architecture choice). Do **not** consult it for routine actions (read, search, a small edit, a lint fix): those do not need a judgement call.
+
+`jev_decide` only informs; it never replaces the user approval gate (ASK_MECHANISM) or native OpenCode permission. If the protocol requires user approval, that gate stands regardless of any Jev verdict.
 
 The plugin does **not** register a `permission.ask` handler. That hook is declared in the plugin types but is not triggered by opencode 1.19.0, so any handler would be dead code that appears to arbitrate permissions without doing so.
 
@@ -191,13 +200,13 @@ The plugin is designed so it can never break opencode's flow and never weakens t
 - **Missing key or base URL** — every hook degrades to a no-op and logs a warning once. opencode startup never crashes. No default host is ever called.
 - **Invalid or unavailable verdict** — an absent, malformed, contradictory, out-of-range, timed-out, or disabled answer is reported as `invalid`/`unavailable` and carries no verdict. It is never treated as permission to proceed.
 - **Per-category failure policy** — a non-actionable verdict for a high-impact action (destructive or high-impact category) surfaces a warning; low-risk categories stay silent. Neither case relaxes opencode's native approval flow.
-- **Block only** — `tool.execute.before` either throws (deny) or returns (defer). The plugin cannot auto-allow, so a model verdict never bypasses opencode's permission controls.
+- **Block only** — `tool.execute.before` either throws (deny) or returns (defer). The plugin cannot auto-allow, so a model verdict never bypasses opencode's permission controls. This gate is **off by default**; when disabled, opencode's native permission flow is the sole authority for tool calls.
 - **Never blocks the loop** — a Jev answer can only *add* a block; it can never stall the main agent loop. The blocking hook runs on a tight budget with no retry, so a hung provider fails open after one `timeoutMs` (~3s), including when the local hint is destructive.
 - **Bounded network** — each request carries an `AbortSignal.timeout` (default 3000ms, configurable). Non-blocking hooks retry at most once, and only for transient failures (timeouts, connection errors, `429`, and `5xx`); the blocking `tool.execute.before` hook never retries. A deterministic `4xx` is never retried.
 - **Failure short-circuit** — after three consecutive provider/transport/timeout failures the client opens a short-TTL (5s) circuit and fails open without any network call, so a down provider is not hit by every hook. A single success resets the streak. It is bounded and fail-open: it never throws and never stalls.
 - **Diagnosable failures** — a provider failure records its HTTP status and a bounded, single-line, key-redacted response-body snippet (clipped to 200 characters) in the decision-log `detail`, so `unavailable:provider` is no longer opaque. The API key is redacted from the snippet before it is stored.
 - **No secret leakage** — the API key and request bodies are never written to logs or the decision log.
-- **Validated answers** — a `choice` verdict must carry a known label, a finite confidence in `[0, 1]`, and a probability map that does not contradict the selected label. A `noul` verdict must carry a probability in `[0, 1]`.
+- **Validated answers** — every answer is validated against its own type contract: a `choice` verdict must carry a known label drawn from its criteria, a finite confidence in `[0, 1]`, and a probability map that does not contradict the selected label; a `noul` verdict must carry a probability in `[0, 1]`; a `score` verdict must carry a score within its rubric range. An out-of-contract answer is reported as `invalid`, never surfaced as a valid verdict.
 
 ## Development
 

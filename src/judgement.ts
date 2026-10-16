@@ -37,7 +37,7 @@ export type PolicyOptions = {
 }
 
 /** Whether a verdict is a choice verdict. */
-function isChoiceVerdict(verdict: JudgedVerdict): verdict is ChoiceVerdict<string> {
+export function isChoiceVerdict(verdict: JudgedVerdict): verdict is ChoiceVerdict<string> {
   return typeof verdict === "object" && verdict !== null && "choice" in verdict
 }
 

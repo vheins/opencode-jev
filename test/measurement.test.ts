@@ -104,6 +104,9 @@ beforeEach(() => {
     JEV_API_KEY: "test-key",
     JEV_BASE_URL: "https://router.example/v1/systemone",
     JEV_DECISION_LOG: "off",
+    // The automatic tool gate is OFF by default (MEM-037); this measurement
+    // drives the automatic path, so it opts in explicitly.
+    JEV_TOOL_GATE: "1",
   }
 })
 

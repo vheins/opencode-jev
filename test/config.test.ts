@@ -454,3 +454,55 @@ test("loadConfig: an invalid JEV_CACHE_TTL_MS falls back to the default", () => 
   )
   assert.equal(config.cacheTtlMs, 60_000, "a non-positive env TTL must fall back to the default")
 })
+
+test("loadConfig: the automatic tool gate is OFF by default", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.enableToolGate, false, "the tool gate must be opt-in (MEM-037)")
+})
+
+test("loadConfig: JEV_TOOL_GATE=1 enables the tool gate", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_TOOL_GATE: "1" },
+    "k",
+  )
+  assert.equal(config.enableToolGate, true)
+})
+
+test("loadConfig: an enableToolGate option overrides the env (options > env)", () => {
+  const { config } = loadConfig(
+    { enableToolGate: false },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_TOOL_GATE: "1" },
+    "k",
+  )
+  assert.equal(config.enableToolGate, false)
+})
+
+test("loadConfig: a wrong-typed enableToolGate option is ignored and warns", () => {
+  const { config, warnings } = loadConfig(
+    { enableToolGate: "yes" },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.enableToolGate, false, "a non-boolean must not flip the gate on")
+  assert.deepEqual(
+    warnings.map((w) => w.field),
+    ["enableToolGate"],
+  )
+})
+
+test("mutation proof: the tool gate default depends on DEFAULT_ENABLE_TOOL_GATE being false", () => {
+  // If the default were flipped to true, this assertion fails: the gate would
+  // run automatically and opencode's native permission flow would no longer be
+  // the sole authority for tool calls.
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.enableToolGate, false)
+})

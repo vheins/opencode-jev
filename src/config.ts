@@ -83,6 +83,15 @@ export const DEFAULT_DECISION_LOG_BACKUPS = 3
 /** Default for whether every decision also surfaces a toast. */
 export const DEFAULT_TOAST_DECISIONS = false
 
+/**
+ * Default for whether the automatic `tool.execute.before` risk gate runs.
+ *
+ * OFF by default (MEM-037): judgement is on-demand via the `jev_decide` tool,
+ * and opencode's native permission flow is the sole gate for tool calls.
+ * Enabling this restores the automatic destructive-tool block.
+ */
+export const DEFAULT_ENABLE_TOOL_GATE = false
+
 /** Default trace-log path; empty string or `"off"` disables tracing. */
 export const DEFAULT_TRACE_LOG_PATH = join(homedir(), ".local", "share", "opencode", "log", "jev.log")
 
@@ -150,6 +159,8 @@ export type Config = {
   readonly traceLogBackups: number
   /** Whether every decision also surfaces a TUI toast. */
   readonly toastDecisions: boolean
+  /** Whether the automatic `tool.execute.before` risk gate runs (off by default). */
+  readonly enableToolGate: boolean
   /** Per-request timeout (ms). */
   readonly timeoutMs: number
   /** Decision cache TTL (ms). */
@@ -323,6 +334,12 @@ export function loadConfig(
         options,
         "toastDecisions",
         parseBoolean(env.JEV_TOAST_DECISIONS, DEFAULT_TOAST_DECISIONS),
+        warnings,
+      ),
+      enableToolGate: booleanOption(
+        options,
+        "enableToolGate",
+        parseBoolean(env.JEV_TOOL_GATE, DEFAULT_ENABLE_TOOL_GATE),
         warnings,
       ),
       timeoutMs: positiveIntOption(

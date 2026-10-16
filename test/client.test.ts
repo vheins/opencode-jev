@@ -42,6 +42,7 @@ function config(overrides: Partial<Config> = {}): Config {
     traceLogMaxBytes: 1_000_000,
     traceLogBackups: 3,
     toastDecisions: false,
+    enableToolGate: false,
     timeoutMs: 50,
     cacheTtlMs: 60_000,
     maxConcurrent: 4,

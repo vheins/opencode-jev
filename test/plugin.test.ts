@@ -117,6 +117,9 @@ function toolContext(): ToolContext {
 
 beforeEach(() => {
   process.env = { ...originalEnv, JEV_API_KEY: "test-key", JEV_BASE_URL: "https://router.example/v1/systemone" }
+  // The automatic tool gate is OFF by default; the enabled-path tests in this
+  // file opt in here. Tests that need the OFF default delete this variable.
+  process.env.JEV_TOOL_GATE = "1"
   // Pin thresholds to the documented defaults so boundary tests are
   // independent of any JEV_* value inherited from the ambient shell.
   delete process.env.JEV_BLOCK_THRESHOLD
@@ -142,6 +145,88 @@ test("hooks: never registers a permission.ask handler", async () => {
   const { input } = stubInput()
   const hooks = await plugin(input)
   assert.equal(Object.hasOwn(hooks, "permission.ask"), false)
+})
+
+/**
+ * Config-gate tests for the OPTIONAL automatic tool gate.
+ *
+ * The gate is OFF by default (MEM-037): judgement is on-demand via
+ * `tool.jev_decide`, and opencode's native permission flow is the sole gate for
+ * tool calls. These pin the default (no network, no block) and the opt-in path.
+ */
+
+test("tool.execute.before: OFF by default makes no provider call and does not block", async () => {
+  delete process.env.JEV_TOOL_GATE
+  const { input } = stubInput()
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(choiceBody("risk", "destructive", 0.99), { status: 200 })
+  })
+  const hooks = await plugin(input)
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm -rf /" } })
+  assert.equal(called, false, "the gate is off by default and must make no network call")
+})
+
+test("tool.execute.before: option enableToolGate:true restores the destructive block", async () => {
+  delete process.env.JEV_TOOL_GATE
+  const { input } = stubInput()
+  routeFetch(() => new Response(choiceBody("risk", "destructive", 0.95), { status: 200 }))
+  const hooks = await plugin(input, { enableToolGate: true })
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await assert.rejects(
+    () => before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm -rf /tmp/x" } }),
+    /Blocked destructive tool/,
+  )
+})
+
+test("mutation proof: the destructive block depends on the enabled gate AND the destructive label", async () => {
+  // With the gate enabled, a destructive verdict above the threshold MUST
+  // throw. If the gate wiring or the destructive mapping were removed, this
+  // would resolve instead of rejecting.
+  process.env = { ...originalEnv, JEV_API_KEY: "test-key", JEV_BASE_URL: "https://router.example/v1/systemone", JEV_TOOL_GATE: "1" }
+  const { input } = stubInput()
+  routeFetch(() => new Response(choiceBody("risk", "destructive", 0.99), { status: 200 }))
+  const hooks = await plugin(input)
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await assert.rejects(
+    () => before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm -rf /tmp/x" } }),
+    /Blocked destructive tool/,
+  )
+})
+
+test("tool.jev_decide: an out-of-contract choice answer is reported as not valid", async () => {
+  const { input } = stubInput()
+  routeFetch(() =>
+    new Response(
+      JSON.stringify({
+        model: "oc/jev-1.13-free",
+        answers: {
+          judgment: {
+            type: "choice",
+            choice: "maybe",
+            confidence: 0.9,
+            probabilities: { maybe: 0.9 },
+          },
+        },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+      { status: 200 },
+    ),
+  )
+  const hooks = await plugin(input)
+  const decide = hooks.tool?.jev_decide
+  assert.ok(decide)
+  const result = await decide.execute(
+    { state: "{}", type: "choice", instructions: "?", choiceCriteria: { yes: "y", no: "n" } },
+    toolContext(),
+  )
+  assert.match(String(result), /"valid":false/)
+  assert.match(String(result), /unknown-label/)
 })
 
 test("tool.execute.before: blocks a destructive tool above the block threshold", async () => {
@@ -361,7 +446,7 @@ test("tool.jev_decide: returns a disabled message when Jev is not configured", a
   assert.match(String(result), /No base URL set/)
 })
 
-test("tool.jev_decide: returns the typed answer when configured", async () => {
+test("tool.jev_decide: returns the validated typed answer when configured", async () => {
   const { input } = stubInput()
   routeFetch(() => new Response(noulBody("judgment", 0.8), { status: 200 }))
   const hooks = await plugin(input)
@@ -371,7 +456,8 @@ test("tool.jev_decide: returns the typed answer when configured", async () => {
     { state: "{}", type: "noul", instructions: "?" },
     toolContext(),
   )
-  assert.match(String(result), /"noul":0.8/)
+  assert.match(String(result), /"valid":true/)
+  assert.match(String(result), /"answer":0.8/)
 })
 
 test("tool.jev_decide: choice without two criteria is rejected locally", async () => {
@@ -407,12 +493,12 @@ test("tool.jev_decide: score request returns the score answer through the provid
     toolContext(),
   )
   assert.equal(seenType, "score", "the request must carry a score question")
-  assert.match(String(result), /"type":"score"/)
+  assert.match(String(result), /"valid":true/)
   assert.match(String(result), /"score":0.75/)
 })
 
 test("plugin: options.baseUrl configures Jev without any JEV_BASE_URL env", async () => {
-  process.env = { ...originalEnv, JEV_API_KEY: "env-key" }
+  process.env = { ...originalEnv, JEV_API_KEY: "env-key", JEV_TOOL_GATE: "1" }
   delete process.env.JEV_BASE_URL
   const { input, logs } = stubInput()
   let calledUrl: string | undefined
@@ -433,7 +519,7 @@ test("plugin: options.baseUrl configures Jev without any JEV_BASE_URL env", asyn
 })
 
 test("plugin: options.apiKey is sent as the bearer token and never logged", async () => {
-  process.env = { ...originalEnv }
+  process.env = { ...originalEnv, JEV_TOOL_GATE: "1" }
   delete process.env.JEV_API_KEY
   delete process.env.JEV_BASE_URL
   const { input, logs } = stubInput()
@@ -453,7 +539,7 @@ test("plugin: options.apiKey is sent as the bearer token and never logged", asyn
 })
 
 test("plugin: an invalid option is ignored with a warning and Jev still runs on env", async () => {
-  process.env = { ...originalEnv, JEV_API_KEY: "env-key", JEV_BASE_URL: "https://env.example/v1" }
+  process.env = { ...originalEnv, JEV_API_KEY: "env-key", JEV_BASE_URL: "https://env.example/v1", JEV_TOOL_GATE: "1" }
   const { input, logs } = stubInput()
   globalThis.fetch = (async () => new Response(noulBody("risk", 0.9), { status: 200 })) as typeof fetch
   const hooks = await plugin(input, { baseUrl: 123 })
@@ -685,6 +771,7 @@ test("plugin: writes a decision-log line for a valid tool verdict and never leak
       JEV_API_KEY: secret,
       JEV_BASE_URL: "https://router.example/v1/systemone",
       JEV_DECISION_LOG: logPath,
+      JEV_TOOL_GATE: "1",
     }
     const { input, logs } = stubInput()
     routeFetch(() => new Response(choiceBody("risk", "destructive", 0.95), { status: 200 }))
@@ -896,6 +983,7 @@ test("plugin: a provider failure is logged with its HTTP status and no secret", 
       JEV_API_KEY: secret,
       JEV_BASE_URL: "https://router.example/v1/systemone",
       JEV_DECISION_LOG: logPath,
+      JEV_TOOL_GATE: "1",
     }
     const { input } = stubInput()
     globalThis.fetch = (async () =>
@@ -923,6 +1011,7 @@ test("plugin: traceLog OFF (default) writes no trace file for a hook call", asyn
       JEV_BASE_URL: "https://router.example/v1/systemone",
       JEV_DECISION_LOG: "off",
       JEV_TRACE_LOG_PATH: join(dir, "trace.log"),
+      JEV_TOOL_GATE: "1",
     }
     delete process.env.JEV_TRACE_LOG
     const { input } = stubInput()
@@ -948,6 +1037,7 @@ test("plugin: traceLog ON writes one entry per JEV call with hook, model, and ou
       JEV_DECISION_LOG: "off",
       JEV_TRACE_LOG: "1",
       JEV_TRACE_LOG_PATH: tracePath,
+      JEV_TOOL_GATE: "1",
     }
     const { input } = stubInput()
     routeFetch(() => new Response(choiceBody("risk", "mutating", 0.9), { status: 200 }))

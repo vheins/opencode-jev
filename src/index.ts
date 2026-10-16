@@ -11,12 +11,14 @@
  * models. `JEV_BASE_URL` is REQUIRED: the plugin ships no default host.
  *
  * Hooks provided:
- * - `tool.execute.before`: classifies a tool call and blocks a destructive
- *   action whose confidence exceeds the block threshold. It can only ever
- *   add a block; it never auto-allows, so opencode's native permission flow
- *   remains the sole gate for execution.
  * - `tool.jev_decide`: exposes Choice / Score / Noul judgments over arbitrary
- *   state as a callable tool.
+ *   state as a callable tool, validated per type. This is the primary,
+ *   on-demand judgement path.
+ * - `tool.execute.before`: the OPTIONAL automatic risk gate. OFF by default
+ *   (enable with the `enableToolGate` option or `JEV_TOOL_GATE`); when enabled
+ *   it classifies a tool call and blocks a destructive action whose confidence
+ *   exceeds the block threshold. It can only ever add a block; it never
+ *   auto-allows, so opencode's native permission flow remains the sole gate.
  * - `chat.message`: classifies each user message (code_only | needs_model |
  *   needs_human) and raises a toast on a confident needs_human. This hook is
  *   observe-only: it cannot reroute the message, so it is reported as a
@@ -50,10 +52,20 @@ import {
 } from "./decision-log.ts"
 import {
   classifyNoul,
-  classifyRisk,
   classifySeverity,
+  RISK_INSTRUCTIONS,
+  RISK_QUESTION_ID,
 } from "./decisions.ts"
-import type { ChoiceVerdict, Decision, LogLevel, RiskLevel } from "./domain.ts"
+import {
+  RISK_CRITERIA,
+  type ChoiceVerdict,
+  type Decision,
+  type JudgedDecision,
+  type JudgedVerdict,
+  type JudgementRequest,
+  type LogLevel,
+} from "./domain.ts"
+import { decidePolicy, isChoiceVerdict, judge } from "./judgement.ts"
 import {
   classifyFileSensitivity,
   classifyLocally,
@@ -61,10 +73,10 @@ import {
   failurePolicy,
   riskCacheScope,
   type ActionCategory,
+  type LocalClassification,
 } from "./policy.ts"
 import type { TraceLogOptions } from "./trace-log.ts"
-import { parseResponse } from "./validate.ts"
-
+import { parseResponse, unavailable } from "./validate.ts"
 /** Log service name stamped on every entry this plugin emits. */
 const SERVICE = "opencode-jev"
 
@@ -129,25 +141,6 @@ class WarnOnce {
   }
 }
 
-/** A validated tool-risk decision outcome. */
-type RiskDecision = Decision<ChoiceVerdict<RiskLevel>>
-
-/** Describe a non-actionable decision for logging. */
-function describeDecision(decision: RiskDecision): string {
-  switch (decision.kind) {
-    case "invalid":
-      return `invalid:${decision.reason}`
-    case "unavailable":
-      return decision.detail === undefined
-        ? `unavailable:${decision.reason}`
-        : `unavailable:${decision.reason} (${decision.detail})`
-    case "abstain":
-      return `abstain:${decision.confidence.toFixed(2)}`
-    case "valid":
-      return `valid:${decision.verdict.choice}:${decision.verdict.confidence.toFixed(2)}`
-  }
-}
-
 /** The log-relevant fields distilled from any decision. */
 type DecisionSummary = {
   readonly kind: DecisionKind
@@ -189,6 +182,111 @@ function summarizeNoul(decision: Decision<number>): DecisionSummary {
     case "unavailable":
       return { kind: "unavailable", decision: null, confidence: null }
   }
+}
+
+/** Describe a judged (choice | noul | score) verdict for logging. */
+function describeJudged(decision: JudgedDecision): string {
+  switch (decision.kind) {
+    case "invalid":
+      return `invalid:${decision.reason}`
+    case "unavailable":
+      return decision.detail === undefined
+        ? `unavailable:${decision.reason}`
+        : `unavailable:${decision.reason} (${decision.detail})`
+    case "abstain":
+      return `abstain:${decision.confidence.toFixed(2)}`
+    case "valid":
+      if (isChoiceVerdict(decision.verdict)) {
+        return `valid:${decision.verdict.choice}:${decision.verdict.confidence.toFixed(2)}`
+      }
+      if (typeof decision.verdict === "number") {
+        return `valid:${decision.verdict.toFixed(2)}`
+      }
+      return `valid:score:${decision.verdict.score}`
+  }
+}
+
+/** Distill a judged (choice | noul | score) decision for the decision log. */
+function summarizeJudged(decision: JudgedDecision): DecisionSummary {
+  if (decision.kind === "valid") {
+    if (isChoiceVerdict(decision.verdict)) {
+      return {
+        kind: "valid",
+        decision: decision.verdict.choice,
+        confidence: decision.verdict.confidence,
+      }
+    }
+    if (typeof decision.verdict === "number") {
+      return { kind: "valid", decision: null, confidence: decision.verdict }
+    }
+    return { kind: "valid", decision: `score:${decision.verdict.score}`, confidence: decision.verdict.confidence }
+  }
+  if (decision.kind === "abstain") {
+    return isChoiceVerdict(decision.verdict)
+      ? { kind: "abstain", decision: decision.verdict.choice, confidence: decision.confidence }
+      : { kind: "abstain", decision: null, confidence: decision.confidence }
+  }
+  return { kind: decision.kind, decision: null, confidence: null }
+}
+
+/** The action category implied by the local pre-classification. */
+function localCategory(local: LocalClassification): ActionCategory {
+  if (local.kind === "read_only") return "read_only"
+  if (local.kind === "destructive_hint") return "destructive"
+  return "reversible"
+}
+
+/**
+ * Build the risk judgement request for the tool gate.
+ *
+ * The criteria is the fixed {@link RISK_CRITERIA} label domain, so the request
+ * validates against the same labels the classifier returns.
+ *
+ * @param tool - The tool id being invoked.
+ * @param args - The tool arguments.
+ * @returns A choice judgement request over the risk label domain.
+ */
+function riskRequest(tool: string, args: unknown): JudgementRequest {
+  return {
+    id: RISK_QUESTION_ID,
+    type: "choice",
+    instructions: RISK_INSTRUCTIONS,
+    state: { tool, args },
+    criteria: RISK_CRITERIA,
+  }
+}
+
+/** The arguments accepted by the `jev_decide` tool. */
+type JeveDecideArgs = {
+  readonly type: "choice" | "score" | "noul"
+  readonly instructions: string
+  readonly state: string
+  readonly choiceCriteria?: Record<string, string>
+  readonly scoreCriteria?: readonly string[]
+  readonly noulCriteria?: { readonly true?: string; readonly false?: string }
+  readonly model?: string
+}
+
+/**
+ * Build the judgement request for a `jev_decide` call.
+ *
+ * The declared `type` selects the criteria shape: a choice label map, an
+ * ordered score rubric, or an (unused) empty criteria for noul. `judge` then
+ * validates the answer against that same shape, so an answer whose shape
+ * contradicts the request is rejected.
+ *
+ * @param args - The validated `jev_decide` arguments.
+ * @returns The judgement request matching the declared type.
+ */
+function judgementRequest(args: JeveDecideArgs): JudgementRequest {
+  const base = { id: "judgment", instructions: args.instructions, state: args.state }
+  if (args.type === "choice") {
+    return { ...base, type: "choice", criteria: args.choiceCriteria ?? {} }
+  }
+  if (args.type === "score") {
+    return { ...base, type: "score", criteria: args.scoreCriteria ?? [] }
+  }
+  return { ...base, type: "noul", criteria: {} }
 }
 
 /** Reduce a base URL to its host for display, never echoing the full URL. */
@@ -349,15 +447,14 @@ export default (async (input, options?: PluginOptions) => {
    *
    * @param label - A short label naming the action.
    * @param category - The action category.
-   * @param decision - The non-actionable decision.
+   * @param detail - A short, non-secret description of the decision.
    */
   const reportUnavailable = async (
     label: string,
     category: ActionCategory,
-    decision: RiskDecision,
+    detail: string,
   ): Promise<void> => {
     const policy = failurePolicy(category)
-    const detail = describeDecision(decision)
     if (policy === "warn" && warnOnce.claim(`${label}:${detail}`)) {
       await log("warn", "Jev could not produce an actionable verdict for a high-impact action", {
         label,
@@ -369,7 +466,9 @@ export default (async (input, options?: PluginOptions) => {
 
   const jevDecide = tool({
     description:
-      "Ask TypeSafe Jev (System One) a structured judgment about arbitrary state, routed through the router provider. Supports choice, score, and noul question types and returns the typed answer as JSON.",
+      "Ask TypeSafe Jev (System One) a structured judgment about arbitrary state, routed through the router provider. Supports choice, score, and noul question types and returns the typed answer as JSON.\n\n" +
+      "When to use: consult jev_decide for CONSEQUENTIAL, hard-to-reverse decisions with >=2 viable options (for example: a destructive migration, an irreversible data change, choosing between competing architectures with long-lived cost). Do NOT use it for routine actions (read, search, a small edit, a lint fix) — those do not need a judgement call.\n\n" +
+      "jev_decide only informs; it never replaces the user approval gate (ASK_MECHANISM) or native OpenCode permission. If the protocol requires user approval, that gate stands regardless of any Jev verdict.",
     args: {
       state: tool.schema.string().describe("The text or JSON state to evaluate."),
       type: tool.schema.enum(["choice", "score", "noul"]).describe("Question type to ask."),
@@ -427,11 +526,32 @@ export default (async (input, options?: PluginOptions) => {
         await record("tool.jev_decide", { kind: "invalid", decision: null, confidence: null }, "return", args.type)
         return "jev_decide failed: malformed response"
       }
-      await log("info", "jev_decide completed", { type: args.type, model: parsed.model })
-      await record("tool.jev_decide", { kind: "valid", decision: args.type, confidence: null }, "return")
+      // Validate the answer against its own type contract before it is used:
+      // an out-of-contract answer (unknown choice label, non-boolean noul,
+      // out-of-range score) is reported as its ACTUAL outcome, never as valid.
+      const request = judgementRequest(args)
+      const decision = judge(request, parsed.answers.judgment)
+      await log("info", "jev_decide completed", {
+        type: args.type,
+        model: parsed.model,
+        outcome: decision.kind,
+      })
+      await record("tool.jev_decide", summarizeJudged(decision), "return", describeJudged(decision))
+      if (decision.kind !== "valid") {
+        // Fail-open: a rejected or unavailable answer is never surfaced as a
+        // verdict. The envelope-only fields are still returned for diagnosis.
+        return safeStringify({
+          model: parsed.model,
+          valid: false,
+          outcome: decision.kind,
+          detail: describeJudged(decision),
+          usage: parsed.usage,
+        })
+      }
       return safeStringify({
         model: parsed.model,
-        answer: parsed.answers.judgment,
+        valid: true,
+        answer: decision.verdict,
         usage: parsed.usage,
       })
     },
@@ -442,17 +562,27 @@ export default (async (input, options?: PluginOptions) => {
       jev_decide: jevDecide,
     },
     "tool.execute.before": async (hookInput, output) => {
+      // OPTIONAL automatic gate, OFF by default (MEM-037): judgement is
+      // on-demand via `jev_decide`, and opencode's native permission flow is
+      // the sole gate for tool calls. Disabled -> return before any network
+      // call or local classification, so the default install adds no latency.
+      if (!config.enableToolGate) return
       if (!config.enabled) return
       const local = classifyLocally(hookInput.tool, output.args)
       if (local.kind === "read_only") return
+      const category = localCategory(local)
       try {
-        const decision = await classifyRisk(
-          systemOne,
-          {
+        // Ask Jev for the risk verdict, then validate the answer against the
+        // risk label domain via `judge`. A transport failure becomes an
+        // `unavailable` decision, so the same fail-open policy applies.
+        const result = await systemOne.request(
+          safeStringify({
             tool: hookInput.tool,
             args: output.args,
             localSignal: local.kind === "destructive_hint" ? local.reason : undefined,
-          },
+          }),
+          { [RISK_QUESTION_ID]: choice(RISK_INSTRUCTIONS, RISK_CRITERIA) },
+          undefined,
           // Blocking hook: no retry, so worst-case blocking latency is one
           // timeout (~3s), not two. Fail-open on timeout is preserved.
           {
@@ -470,44 +600,48 @@ export default (async (input, options?: PluginOptions) => {
               : {}),
           },
         )
-        if (decision.kind === "valid") {
+        const decision: JudgedDecision = result.ok
+          ? judge(
+              riskRequest(hookInput.tool, output.args),
+              parseResponse(result.body)?.answers[RISK_QUESTION_ID],
+            )
+          : unavailable<JudgedVerdict>(result.failure.kind, result.failure.detail)
+        const action = decidePolicy(decision, category, { blockThreshold: config.blockThreshold })
+        if (decision.kind === "valid" && isChoiceVerdict(decision.verdict)) {
+          const verdict = decision.verdict
           await log("info", "Jev tool risk verdict", {
             tool: hookInput.tool,
-            choice: decision.verdict.choice,
-            confidence: decision.verdict.confidence,
+            choice: verdict.choice,
+            confidence: verdict.confidence,
           })
-          const blocks =
-            decision.verdict.choice === "destructive" &&
-            decision.verdict.confidence > config.blockThreshold
+          // `revise` is exactly destructive + confidence > blockThreshold; the
+          // throw below is the byte-identical destructive gate.
+          const blocks = verdict.choice === "destructive" && verdict.confidence > config.blockThreshold
           await record(
             "tool.execute.before",
-            summarizeChoice(decision),
+            summarizeChoice({ kind: "valid", verdict }),
             blocks ? "block" : "allow",
             hookInput.tool,
           )
           if (blocks) {
             throw new JevBlockError(
-              `[jev] Blocked destructive tool "${hookInput.tool}" (confidence ${decision.verdict.confidence.toFixed(3)} > ${config.blockThreshold}).`,
+              `[jev] Blocked destructive tool "${hookInput.tool}" (confidence ${verdict.confidence.toFixed(3)} > ${config.blockThreshold}).`,
             )
           }
           return
         }
-        // Non-actionable: never relax the native gate. Warn only for the
-        // category the local pre-classification (or Jev's own history) marks
-        // high-impact, and only for invalid/unavailable or a destructive hint.
+        // Non-actionable: never relax the native gate. `verify` (the fail-open
+        // mapping for invalid/unavailable/abstain) warns only for the category
+        // the failure policy marks high-impact; low-risk stays silent.
         await record(
           "tool.execute.before",
-          summarizeChoice(decision),
+          summarizeJudged(decision),
           "log",
-          describeDecision(decision),
+          describeJudged(decision),
         )
-        const category: ActionCategory =
-          local.kind === "destructive_hint" ? "destructive" : "reversible"
-        const warnWorthy =
-          decision.kind === "invalid" ||
-          decision.kind === "unavailable" ||
-          (decision.kind === "abstain" && local.kind === "destructive_hint")
-        if (warnWorthy) await reportUnavailable(hookInput.tool, category, decision)
+        if (action === "verify") {
+          await reportUnavailable(hookInput.tool, category, describeJudged(decision))
+        }
       } catch (error) {
         if (error instanceof JevBlockError) throw error
         await log("warn", "Jev tool guard failed", { error: errorMessage(error) })
