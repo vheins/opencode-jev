@@ -178,6 +178,67 @@ test("request: a different policy version misses the cache", async () => {
   assert.equal(calls, 2, "a policy-version change must invalidate the cache")
 })
 
+test("request: a shared cacheScope lets different states hit the cache", async () => {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    return new Response(JSON.stringify({ model: "m", answers: {}, usage: {} }), { status: 200 })
+  }) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+  await client.request("state-a", QUESTIONS, undefined, { cacheScope: "bash\u0000unknown" })
+  await client.request("state-b", QUESTIONS, undefined, { cacheScope: "bash\u0000unknown" })
+  assert.equal(calls, 1, "states sharing a safety scope must be served from cache")
+})
+
+test("request: a different cacheScope misses the cache", async () => {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    return new Response(JSON.stringify({ model: "m", answers: {}, usage: {} }), { status: 200 })
+  }) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+  await client.request("state", QUESTIONS, undefined, { cacheScope: "bash\u0000unknown" })
+  await client.request("state", QUESTIONS, undefined, { cacheScope: "bash\u0000destructive:rm" })
+  assert.equal(calls, 2, "a different safety scope must not reuse a cached verdict")
+})
+
+test("request: absent a cacheScope the full state remains the key", async () => {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    return new Response(JSON.stringify({ model: "m", answers: {}, usage: {} }), { status: 200 })
+  }) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+  await client.request("state-a", QUESTIONS)
+  await client.request("state-b", QUESTIONS)
+  assert.equal(calls, 2, "without a scope the full state must still separate cache entries")
+})
+
+test("request: a cache hit is honored within the configured TTL", async () => {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    return new Response(JSON.stringify({ model: "m", answers: {}, usage: {} }), { status: 200 })
+  }) as typeof fetch
+  const client = new SystemOneClient(config({ cacheTtlMs: 60_000 }), "v")
+  await client.request("state", QUESTIONS)
+  await client.request("state", QUESTIONS)
+  assert.equal(calls, 1, "a hit within the TTL must not re-call the provider")
+})
+
+test("request: an expired TTL forces a fresh call", async () => {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    return new Response(JSON.stringify({ model: "m", answers: {}, usage: {} }), { status: 200 })
+  }) as typeof fetch
+  // A 0ms TTL means every entry is immediately stale, so the second call misses.
+  const client = new SystemOneClient(config({ cacheTtlMs: 0 }), "v")
+  await client.request("state", QUESTIONS)
+  await client.request("state", QUESTIONS)
+  assert.equal(calls, 2, "an expired TTL must force a fresh call")
+})
+
 test("request: fails fast as busy when the concurrency bound is exhausted", async () => {
   let release: (() => void) | undefined
   globalThis.fetch = (async () => {

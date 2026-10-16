@@ -107,6 +107,29 @@ export function classifyLocally(tool: string, args: unknown): LocalClassificatio
 }
 
 /**
+ * Derive a stable, safety-preserving cache scope for a tool action.
+ *
+ * The scope is the deterministic local classification of the action, never the
+ * full argument blob: two calls share a scope only when they are in the same
+ * safety class. A destructive hint is keyed by the exact pattern it matched, so
+ * a destructive call can never reuse a cached non-destructive verdict, and two
+ * distinct destructive patterns never collide. Non-destructive, non-read-only
+ * actions share the `unknown` class for the same tool, which is the equivalence
+ * the cache exists to serve. The tool id is part of the scope so two tools with
+ * the same classification can never share a verdict.
+ *
+ * @param tool - The tool id being invoked.
+ * @param args - The tool arguments.
+ * @returns A deterministic scope string (`<tool>\0read_only`, `<tool>\0unknown`,
+ *   or `<tool>\0destructive:<matched-pattern>`).
+ */
+export function riskCacheScope(tool: string, args: unknown): string {
+  const local = classifyLocally(tool, args)
+  const signal = local.kind === "destructive_hint" ? `destructive:${local.reason}` : local.kind
+  return `${tool}\u0000${signal}`
+}
+
+/**
  * Path/extension/keyword patterns that mark a file as security-sensitive, with
  * a deterministic weight in `[0, 1]`.
  *

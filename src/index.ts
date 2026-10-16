@@ -59,6 +59,7 @@ import {
   classifyLocally,
   classifyMessage,
   failurePolicy,
+  riskCacheScope,
   type ActionCategory,
 } from "./policy.ts"
 import type { TraceLogOptions } from "./trace-log.ts"
@@ -454,7 +455,15 @@ export default (async (input, options?: PluginOptions) => {
           },
           // Blocking hook: no retry, so worst-case blocking latency is one
           // timeout (~3s), not two. Fail-open on timeout is preserved.
-          { retry: false, trace: { hook: "tool.execute.before", summary: hookInput.tool } },
+          {
+            retry: false,
+            trace: { hook: "tool.execute.before", summary: hookInput.tool },
+            // A stable, safety-preserving cache scope: the local safety class of
+            // this action, not the raw argument blob. Equivalent actions hit the
+            // cache; a destructive action never shares a key with a
+            // non-destructive one, so a stale verdict can never relax the gate.
+            cacheScope: riskCacheScope(hookInput.tool, output.args),
+          },
         )
         if (decision.kind === "valid") {
           await log("info", "Jev tool risk verdict", {

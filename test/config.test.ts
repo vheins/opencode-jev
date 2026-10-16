@@ -407,3 +407,50 @@ test("parsePositiveInt: positive integers pass; missing/zero/negative/non-intege
   assert.equal(parsePositiveInt("1.5", 3000), 3000)
   assert.equal(parsePositiveInt("abc", 3000), 3000)
 })
+
+test("loadConfig: cacheTtlMs defaults to 60000 when nothing is set", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.cacheTtlMs, 60_000)
+})
+
+test("loadConfig: JEV_CACHE_TTL_MS env overrides the default TTL", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_CACHE_TTL_MS: "120000" },
+    "k",
+  )
+  assert.equal(config.cacheTtlMs, 120_000)
+})
+
+test("loadConfig: a cacheTtlMs option overrides the env (options > env)", () => {
+  const { config } = loadConfig(
+    { cacheTtlMs: 5_000 },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_CACHE_TTL_MS: "120000" },
+    "k",
+  )
+  assert.equal(config.cacheTtlMs, 5_000)
+})
+
+test("loadConfig: an invalid cacheTtlMs option is ignored, falls back to env, and warns", () => {
+  const { config, warnings } = loadConfig(
+    { cacheTtlMs: -1 },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_CACHE_TTL_MS: "120000" },
+    "k",
+  )
+  assert.equal(config.cacheTtlMs, 120_000, "a non-positive option must fall back to the env")
+  assert.equal(warnings.length, 1)
+  assert.equal(warnings[0]?.field, "cacheTtlMs")
+})
+
+test("loadConfig: an invalid JEV_CACHE_TTL_MS falls back to the default", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_CACHE_TTL_MS: "0" },
+    "k",
+  )
+  assert.equal(config.cacheTtlMs, 60_000, "a non-positive env TTL must fall back to the default")
+})

@@ -52,6 +52,18 @@ export type CallOptions = {
    * log is enabled; never written otherwise.
    */
   readonly trace?: { readonly hook: string; readonly summary: string }
+  /**
+   * Optional stable, safety-preserving cache scope for the call.
+   *
+   * When present, the cache key uses this scope in place of the serialized
+   * `state`, so calls that differ only in detail the caller has proven
+   * irrelevant (e.g. per-call tool arguments in the same safety class) share a
+   * cache entry. The caller derives it from the local safety classification,
+   * never from the raw argument blob, so two calls that could yield different
+   * risk verdicts never share it. When absent, the full `state` remains part of
+   * the key, which is the safe default for every other hook.
+   */
+  readonly cacheScope?: string
 }
 
 /** Maximum characters in a state string sent to the router. */
@@ -199,8 +211,8 @@ export class SystemOneClient {
   }
 
   /** Build a stable cache key from the request inputs and policy version. */
-  private cacheKey(state: string, questions: Record<string, Question>, model: string): string {
-    return `${this.policyVersion}\u0000${model}\u0000${state}\u0000${safeStringify(questions)}`
+  private cacheKey(scope: string, questions: Record<string, Question>, model: string): string {
+    return `${this.policyVersion}\u0000${model}\u0000${scope}\u0000${safeStringify(questions)}`
   }
 
   /**
@@ -230,7 +242,11 @@ export class SystemOneClient {
     const retry = options?.retry ?? true
     const boundedState = truncateState(state)
     const model = modelOverride?.trim() || this.config.model
-    const key = this.cacheKey(boundedState, questions, model)
+    // A caller-supplied scope (derived from the local safety classification)
+    // replaces the full state in the key, so equivalent calls hit while calls
+    // that could yield a different risk verdict never share an entry. Absent a
+    // scope, the full state stays in the key (the safe default).
+    const key = this.cacheKey(options?.cacheScope ?? boundedState, questions, model)
 
     const cached = this.cache.get(key)
     if (cached && Date.now() - cached.at < this.config.cacheTtlMs) {

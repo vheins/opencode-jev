@@ -18,6 +18,7 @@ import {
   classifyLocally,
   failurePolicy,
   isHighImpact,
+  riskCacheScope,
 } from "../src/policy.ts"
 
 test("classifyLocally: known read-only tools skip Jev", () => {
@@ -92,4 +93,50 @@ test("classifyFileSensitivity: malformed input never throws and scores 0", () =>
     assert.equal(result.score, 0, `input=${String(input)}`)
     assert.equal(typeof result.reason, "string")
   }
+})
+
+/**
+ * Cache-scope tests.
+ *
+ * The scope is the safety discriminator in the client cache key. It must be
+ * stable for genuinely-equivalent calls (same tool, same safety class) and must
+ * separate any two calls that could yield a different risk verdict. A
+ * mutation that drops the tool id, collapses the destructive signal, or keys on
+ * the raw args blob makes at least one of these fail.
+ */
+
+test("riskCacheScope: equivalent non-destructive calls of the same tool share a scope", () => {
+  const a = riskCacheScope("bash", { command: "echo one > a.txt" })
+  const b = riskCacheScope("bash", { command: "echo two > b.txt" })
+  assert.equal(a, b, "different args in the same safety class must share a scope")
+})
+
+test("riskCacheScope: a read-only tool and a destructive call never share a scope", () => {
+  const readOnly = riskCacheScope("bash", { command: "ls -la" })
+  const destructive = riskCacheScope("bash", { command: "rm -rf /tmp/x" })
+  assert.notEqual(readOnly, destructive, "a destructive call must not reuse a non-destructive key")
+})
+
+test("riskCacheScope: two distinct destructive patterns do not collide", () => {
+  const rm = riskCacheScope("bash", { command: "rm -rf /tmp/x" })
+  const forcePush = riskCacheScope("bash", { command: "git push origin main --force" })
+  assert.notEqual(rm, forcePush, "distinct destructive signals must be distinct scopes")
+})
+
+test("riskCacheScope: the same destructive pattern is stable across calls", () => {
+  const a = riskCacheScope("bash", { command: "rm -rf /tmp/one" })
+  const b = riskCacheScope("bash", { command: "rm -rf /var/two" })
+  assert.equal(a, b, "the same destructive pattern must yield a stable scope")
+})
+
+test("riskCacheScope: the tool id is always part of the scope", () => {
+  const edit = riskCacheScope("edit", { filePath: "src/a.ts" })
+  const write = riskCacheScope("write", { filePath: "src/a.ts" })
+  assert.notEqual(edit, write, "two tools must never share a scope")
+  assert.equal(edit.startsWith("edit\u0000"), true)
+})
+
+test("riskCacheScope: is deterministic for identical input", () => {
+  const args = { command: "psql -c 'DROP TABLE users'" }
+  assert.equal(riskCacheScope("bash", args), riskCacheScope("bash", args))
 })

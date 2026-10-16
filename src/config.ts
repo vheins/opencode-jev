@@ -111,7 +111,6 @@ export const DEFAULT_TIMEOUT_MS = 3_000
 
 /** How long a decision may be reused for identical input (ms). */
 export const DEFAULT_CACHE_TTL_MS = 60_000
-
 /** Maximum number of in-flight Jev requests; further calls fail fast as `busy`. */
 export const MAX_CONCURRENT_REQUESTS = 4
 
@@ -332,7 +331,12 @@ export function loadConfig(
         parsePositiveInt(env.JEV_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
         warnings,
       ),
-      cacheTtlMs: DEFAULT_CACHE_TTL_MS,
+      cacheTtlMs: positiveIntOption(
+        options,
+        "cacheTtlMs",
+        parsePositiveInt(env.JEV_CACHE_TTL_MS, DEFAULT_CACHE_TTL_MS),
+        warnings,
+      ),
       maxConcurrent: MAX_CONCURRENT_REQUESTS,
     },
     ...(disabledReason ? { disabledReason } : {}),

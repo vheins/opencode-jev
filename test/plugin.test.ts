@@ -790,6 +790,56 @@ test("fail-open: a destructive hint that times out does NOT throw", async () => 
   assert.equal(calls, 1)
 })
 
+/**
+ * Cache-scope integration tests.
+ *
+ * These prove the two halves of the cache optimization at the real hook
+ * boundary: equivalent actions now hit the cache, and a destructive action can
+ * never reuse a cached non-destructive verdict. A mutation that keys the cache
+ * on the raw args blob fails the hit test; a mutation that drops the safety
+ * discriminator fails the block test.
+ */
+
+test("tool.execute.before: equivalent bash calls hit the cache (one network call)", async () => {
+  const { input } = stubInput()
+  let calls = 0
+  routeFetch(() => {
+    calls += 1
+    return new Response(choiceBody("risk", "mutating", 0.9), { status: 200 })
+  })
+  const hooks = await plugin(input)
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo one > a.txt" } })
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo two > b.txt" } })
+  assert.equal(calls, 1, "equivalent same-safety-class calls must share a cache entry")
+})
+
+test("tool.execute.before: a destructive call does NOT reuse a cached non-destructive verdict", async () => {
+  const { input } = stubInput()
+  let calls = 0
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    calls += 1
+    const body = JSON.parse(String(init?.body)) as { state: string }
+    // A benign call is read_only; the destructive call is destructive. If the
+    // destructive call reused the cached read_only verdict it would not block.
+    const destructive = body.state.includes("rm -rf")
+    return new Response(choiceBody("risk", destructive ? "destructive" : "read_only", 0.95), {
+      status: 200,
+    })
+  }) as typeof fetch
+  const hooks = await plugin(input)
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo hi" } })
+  await assert.rejects(
+    () => before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm -rf /tmp/x" } }),
+    /Blocked destructive tool/,
+    "a destructive call must never reuse a cached read_only verdict",
+  )
+  assert.equal(calls, 2, "the destructive call must miss the cache and reach the provider")
+})
+
 test("tool.execute.before: low-risk meta tools (todowrite, task-read) never call the provider", async () => {
   const { input } = stubInput()
   let called = false
