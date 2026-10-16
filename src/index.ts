@@ -1,11 +1,11 @@
 /**
- * opencode-Jev integration plugin (9router-spasi routed).
+ * opencode-Jev integration plugin.
  *
  * Bridges TypeSafe Jev (System One) structured judgments into opencode's
  * built-in plugin hooks. Jev is not a model replacement: it returns typed
  * answers (Choice / Score / Noul) that this plugin branches on.
  *
- * All Jev calls go through the existing `9router-spasi` provider, which
+ * All Jev calls go through the configured router provider, which
  * exposes a pass-through route at `POST https://model.spasi.biz.id/v1/systemone`
  * (alias `/systemone`). The router forwards the body untouched and returns the
  * native System One JSON, authenticated with the same bearer key used for chat
@@ -28,7 +28,7 @@
  * - `event`: handles `session.error` (severity: transient | real_bug | fatal)
  *   and `file.edited` (security-sensitive review check).
  *
- * When no spasi key is available the plugin degrades to a no-op that warns
+ * When no JEV key is available the plugin degrades to a no-op that warns
  * once, so opencode startup never crashes. Every hook is throw-safe: a Jev
  * failure or missing key degrades to a no-op + warn and never breaks opencode's
  * flow.
@@ -51,8 +51,8 @@ const SERVICE = "opencode-jev"
 /** Router pass-through route for System One judgments. */
 const DEFAULT_BASE_URL = "https://model.spasi.biz.id/v1/systemone"
 
-/** Fallback key file written by the 9router-spasi provider setup. */
-const DEFAULT_KEY_FILE = join(homedir(), ".config", "opencode", ".spasi-key")
+/** Fallback key file written by the router provider setup. */
+const DEFAULT_KEY_FILE = join(homedir(), ".config", "opencode", ".jev-key")
 
 /**
  * Jev model id used when `JEV_MODEL` is unset.
@@ -260,12 +260,12 @@ function extractText(parts: ReadonlyArray<{ type?: string; text?: string }>): st
 }
 
 /**
- * Resolve the spasi API key from the environment, then the provider key file.
+ * Resolve the JEV API key from the environment, then the provider key file.
  *
  * @returns The trimmed key, or `undefined` when neither source yields one.
  */
 function resolveApiKey(): string | undefined {
-  const fromEnv = process.env.SPASI_API_KEY?.trim()
+  const fromEnv = process.env.JEV_API_KEY?.trim()
   if (fromEnv) return fromEnv
   try {
     const fromFile = readFileSync(DEFAULT_KEY_FILE, "utf8").trim()
@@ -347,12 +347,12 @@ export default (async (input) => {
   } else {
     await log(
       "warn",
-      "No spasi key found (SPASI_API_KEY or .spasi-key); Jev guardrails are a no-op.",
+      "No JEV key found (JEV_API_KEY or .jev-key); Jev guardrails are a no-op.",
     )
   }
 
   /**
-   * POST a System One request through the 9router-spasi pass-through route.
+   * POST a System One request through the router pass-through route.
    *
    * The router forwards the body untouched and returns native System One JSON,
    * so a raw fetch is used instead of the SDK client to keep the wire contract
@@ -371,7 +371,7 @@ export default (async (input) => {
     override?: string,
   ): Promise<SystemOneResponse> => {
     if (!apiKey) {
-      throw new Error("No spasi key configured")
+      throw new Error("No JEV key configured")
     }
     const boundedState = truncateState(state)
     const response = await fetch(baseUrl, {
@@ -518,7 +518,7 @@ export default (async (input) => {
 
   const jevDecide = tool({
     description:
-      "Ask TypeSafe Jev (System One) a structured judgment about arbitrary state, routed through the 9router-spasi provider. Supports choice, score, and noul question types and returns the typed answer as JSON.",
+      "Ask TypeSafe Jev (System One) a structured judgment about arbitrary state, routed through the router provider. Supports choice, score, and noul question types and returns the typed answer as JSON.",
     args: {
       state: tool.schema
         .string()
@@ -551,7 +551,7 @@ export default (async (input) => {
     },
     async execute(args) {
       if (!apiKey) {
-        return "Jev is disabled: no spasi key found (SPASI_API_KEY or .spasi-key). Set it and restart opencode to enable jev_decide."
+        return "Jev is disabled: no JEV key found (JEV_API_KEY or .jev-key). Set it and restart opencode to enable jev_decide."
       }
       try {
         const questions = (() => {

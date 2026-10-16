@@ -4,7 +4,7 @@ An [opencode](https://opencode.ai) plugin that routes **TypeSafe Jev (System One
 
 Jev is not a drop-in model replacement. It answers named questions about a piece of state and returns **typed** results (`choice`, `score`, `noul`) that the plugin branches on to make guardrail decisions: block a destructive tool call, arbitrate a permission prompt, triage a session error, and so on.
 
-All Jev calls go through the existing **9router-spasi** provider, which exposes a pass-through route at `POST /v1/systemone`. The router forwards the body untouched and returns the native System One JSON.
+All Jev calls go through the configured router provider, which exposes a pass-through route at `POST /v1/systemone`. The router forwards the body untouched and returns the native System One JSON.
 
 ## Install
 
@@ -19,7 +19,7 @@ Add the package to your opencode config (`opencode.json`):
 }
 ```
 
-opencode installs the plugin with Bun at startup and caches it under `~/.cache/opencode/`. Then set the spasi key (see [Configuration](#configuration)) and restart opencode.
+opencode installs the plugin with Bun at startup and caches it under `~/.cache/opencode/`. Then set the JEV key (see [Configuration](#configuration)) and restart opencode.
 
 ### From source
 
@@ -45,11 +45,11 @@ Then restart opencode (config and plugins load at startup).
 
 ## Configuration
 
-Copy `.opencode/.env.example` to `.env` (or export the variables in your shell). Every value is optional except the spasi key, which enables the guardrails.
+Copy `.opencode/.env.example` to `.env` (or export the variables in your shell). Every value is optional except the JEV key, which enables the guardrails.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SPASI_API_KEY` | — | Bearer key for the 9router-spasi provider. If unset, the plugin falls back to the key file below, then no-ops with a warning. |
+| `JEV_API_KEY` | — | Bearer key for the router provider. If unset, the plugin falls back to the key file below, then no-ops with a warning. |
 | `JEV_BASE_URL` | `https://model.spasi.biz.id/v1/systemone` | Router pass-through route for System One judgments. |
 | `JEV_MODEL` | `oc/jev-1.13-free` | Jev model id (confirmed against this deployment). |
 | `JEV_BLOCK_THRESHOLD` | `0.85` | Block a destructive tool call when confidence exceeds this value. |
@@ -58,7 +58,7 @@ Copy `.opencode/.env.example` to `.env` (or export the variables in your shell).
 | `JEV_SEVERITY_THRESHOLD` | `0.8` | Toast when a `session.error` severity resolves to `real_bug`/`fatal` at or above this confidence. |
 | `JEV_COMPACT_THRESHOLD` | `0.75` | Append a preservation reminder to compaction context at or above this probability. |
 
-Key resolution order: `SPASI_API_KEY` environment variable, then the file `~/.config/opencode/.spasi-key`. **Never commit a real key.** The repository ignores `.env`, `*.key`, and similar files.
+Key resolution order: `JEV_API_KEY` environment variable, then the file `~/.config/opencode/.jev-key`. **Never commit a real key.** The repository ignores `.env`, `*.key`, and similar files.
 
 ## Hook / event map
 
