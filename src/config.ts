@@ -58,8 +58,14 @@ export const DEFAULT_DECISION_LOG_BACKUPS = 3
 /** Default for whether every decision also surfaces a toast. */
 export const DEFAULT_TOAST_DECISIONS = false
 
-/** Per-request timeout (ms) for a Jev call, so a hung router never stalls a hook. */
-export const REQUEST_TIMEOUT_MS = 10_000
+/**
+ * Default per-request timeout (ms) for a Jev call.
+ *
+ * Kept short so a hung router fails open fast and never stalls the main agent
+ * loop; the blocking `tool.execute.before` hook additionally disables the retry
+ * so its worst case is one timeout, not two.
+ */
+export const DEFAULT_TIMEOUT_MS = 3_000
 
 /** How long a decision may be reused for identical input (ms). */
 export const DEFAULT_CACHE_TTL_MS = 60_000
@@ -279,6 +285,47 @@ function booleanOption(
 }
 
 /**
+ * Parse a positive integer from an environment value.
+ *
+ * @param raw - Raw environment string, or `undefined` when unset.
+ * @param fallback - Value returned when the input is missing or invalid.
+ * @returns The parsed integer, or `fallback`.
+ */
+export function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed <= 0) return fallback
+  return parsed
+}
+
+/**
+ * Read a positive-integer plugin option.
+ *
+ * A non-integer or non-positive value is ignored and reported, so a malformed
+ * timeout cannot disable the bound silently.
+ *
+ * @param options - The raw plugin options.
+ * @param field - The option key to read.
+ * @param fallback - Value used when the option is absent or invalid.
+ * @param warnings - Collector for ignored-option warnings.
+ * @returns The validated integer, or `fallback`.
+ */
+function positiveIntOption(
+  options: PluginOptions,
+  field: string,
+  fallback: number,
+  warnings: ConfigWarning[],
+): number {
+  if (!(field in options)) return fallback
+  const raw = options[field]
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
+    warnings.push({ field, reason: "expected a positive integer" })
+    return fallback
+  }
+  return raw
+}
+
+/**
  * Read the JEV API key from the provider key file only.
  *
  * @returns The trimmed key, or `undefined` when the file is absent or empty.
@@ -409,7 +456,12 @@ export function loadConfig(
         parseBoolean(env.JEV_TOAST_DECISIONS, DEFAULT_TOAST_DECISIONS),
         warnings,
       ),
-      timeoutMs: REQUEST_TIMEOUT_MS,
+      timeoutMs: positiveIntOption(
+        options,
+        "timeoutMs",
+        parsePositiveInt(env.JEV_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+        warnings,
+      ),
       cacheTtlMs: DEFAULT_CACHE_TTL_MS,
       maxConcurrent: MAX_CONCURRENT_REQUESTS,
     },

@@ -12,7 +12,7 @@
 
 import { choice, noul, type Question } from "@typesafe-ai/sdk"
 
-import type { SystemOneClient } from "./client.ts"
+import type { CallOptions, SystemOneClient } from "./client.ts"
 import { safeStringify } from "./client.ts"
 import {
   RISK_CRITERIA,
@@ -79,9 +79,10 @@ async function askChoice<T extends string>(
   criteria: Record<string, string>,
   allowed: readonly T[],
   state: unknown,
+  options?: CallOptions,
 ): Promise<Decision<ChoiceVerdict<T>>> {
   const questions: Record<string, Question> = { [id]: choice(instructions, criteria) }
-  const result = await requester.request(safeStringify(state), questions)
+  const result = await requester.request(safeStringify(state), questions, undefined, options)
   if (!result.ok) return unavailable<ChoiceVerdict<T>>(result.failure.kind)
   const parsed = parseResponse(result.body)
   if (!parsed) return invalid<ChoiceVerdict<T>>("wrong-type")
@@ -95,9 +96,14 @@ async function askChoice<T extends string>(
  *
  * @param requester - The client to ask.
  * @param state - The action description or structured state to classify.
+ * @param options - Optional per-request timeout and retry overrides.
  * @returns A typed decision over the risk verdict.
  */
-export function classifyRisk(requester: Requester, state: unknown): Promise<Decision<RiskVerdict>> {
+export function classifyRisk(
+  requester: Requester,
+  state: unknown,
+  options?: CallOptions,
+): Promise<Decision<RiskVerdict>> {
   return askChoice(
     requester,
     RISK_QUESTION_ID,
@@ -105,6 +111,7 @@ export function classifyRisk(requester: Requester, state: unknown): Promise<Deci
     RISK_CRITERIA,
     RISK_LABELS,
     state,
+    options,
   )
 }
 
@@ -113,11 +120,13 @@ export function classifyRisk(requester: Requester, state: unknown): Promise<Deci
  *
  * @param requester - The client to ask.
  * @param state - The message state to classify.
+ * @param options - Optional per-request timeout and retry overrides.
  * @returns A typed decision over the route verdict.
  */
 export function classifyRoute(
   requester: Requester,
   state: unknown,
+  options?: CallOptions,
 ): Promise<Decision<RouteVerdict>> {
   return askChoice(
     requester,
@@ -126,6 +135,7 @@ export function classifyRoute(
     ROUTE_CRITERIA,
     ROUTE_LABELS,
     state,
+    options,
   )
 }
 
@@ -134,11 +144,13 @@ export function classifyRoute(
  *
  * @param requester - The client to ask.
  * @param state - The error state to classify.
+ * @param options - Optional per-request timeout and retry overrides.
  * @returns A typed decision over the severity verdict.
  */
 export function classifySeverity(
   requester: Requester,
   state: unknown,
+  options?: CallOptions,
 ): Promise<Decision<SeverityVerdict>> {
   return askChoice(
     requester,
@@ -147,6 +159,7 @@ export function classifySeverity(
     SEVERITY_CRITERIA,
     SEVERITY_LABELS,
     state,
+    options,
   )
 }
 
@@ -157,6 +170,7 @@ export function classifySeverity(
  * @param id - Question id used to read the answer.
  * @param instructions - The question text.
  * @param state - The state to evaluate (serialized when not a string).
+ * @param options - Optional per-request timeout and retry overrides.
  * @returns A decision carrying the yes-probability, or an invalid/unavailable result.
  */
 export async function classifyNoul(
@@ -164,9 +178,10 @@ export async function classifyNoul(
   id: string,
   instructions: string,
   state: unknown,
+  options?: CallOptions,
 ): Promise<Decision<number>> {
   const questions: Record<string, Question> = { [id]: noul(instructions) }
-  const result = await requester.request(safeStringify(state), questions)
+  const result = await requester.request(safeStringify(state), questions, undefined, options)
   if (!result.ok) return unavailable<number>(result.failure.kind)
   const parsed = parseResponse(result.body)
   if (!parsed) return invalid<number>("wrong-type")

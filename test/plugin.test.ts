@@ -214,9 +214,13 @@ test("tool.execute.before: unset JEV_BASE_URL degrades to a no-op and never call
   assert.equal(warnedOnce.length >= 1, true)
 })
 
-test("chat.message: observe-only classification raises a toast on confident needs_human", async () => {
+test("chat.message: a high-stakes message raises a toast with zero provider calls", async () => {
   const { input, toasts } = stubInput()
-  routeFetch(() => new Response(choiceBody("route", "needs_human", 0.9), { status: 200 }))
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(choiceBody("route", "needs_human", 0.9), { status: 200 })
+  })
   const hooks = await plugin(input)
   const chat = hooks["chat.message"]
   assert.ok(chat)
@@ -225,11 +229,16 @@ test("chat.message: observe-only classification raises a toast on confident need
     { message: {} as never, parts: [{ type: "text", text: "should I delete the prod database?" } as never] },
   )
   assert.equal(toasts.length, 1)
+  assert.equal(called, false, "the deterministic check must not call the provider")
 })
 
-test("chat.message: no toast below the alert threshold", async () => {
+test("chat.message: a low-stakes message makes no provider call and no toast", async () => {
   const { input, toasts } = stubInput()
-  routeFetch(() => new Response(choiceBody("route", "needs_human", 0.4), { status: 200 }))
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(choiceBody("route", "needs_human", 0.4), { status: 200 })
+  })
   const hooks = await plugin(input)
   const chat = hooks["chat.message"]
   assert.ok(chat)
@@ -238,6 +247,7 @@ test("chat.message: no toast below the alert threshold", async () => {
     { message: {} as never, parts: [{ type: "text", text: "hi" } as never] },
   )
   assert.equal(toasts.length, 0)
+  assert.equal(called, false, "a low-stakes message must not call the provider")
 })
 
 test("experimental.session.compacting: appends the preservation reminder on a confident yes", async () => {
@@ -297,14 +307,19 @@ test("event: a MessageAbortedError is ignored without a provider call", async ()
   assert.equal(called, false)
 })
 
-test("event: file.edited on a security-sensitive file raises a warning toast", async () => {
+test("event: file.edited on a security-sensitive file raises a warning toast with zero provider calls", async () => {
   const { input, toasts } = stubInput()
-  routeFetch(() => new Response(noulBody("security_sensitive", 0.9), { status: 200 }))
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(noulBody("security_sensitive", 0.9), { status: 200 })
+  })
   const hooks = await plugin(input)
   const event = hooks.event
   assert.ok(event)
   await event({ event: { type: "file.edited", properties: { file: ".env" } } as never })
   assert.equal(toasts.length, 1)
+  assert.equal(called, false, "the deterministic file check must not call the provider")
 })
 
 test("hooks: every hook is throw-safe when the provider is unreachable", async () => {
@@ -477,10 +492,8 @@ test("plugin: with no base URL from options or env, Jev degrades to a no-op", as
 
 /** Default thresholds (mirrors src/config.ts) that these boundary tests pin. */
 const BLOCK_THRESHOLD = 0.85
-const ROUTE_THRESHOLD = 0.8
 const COMPACT_THRESHOLD = 0.75
 const SEVERITY_THRESHOLD = 0.8
-const FILE_REVIEW_THRESHOLD = 0.8
 
 /** The destructive command used to trigger the risk guard. */
 const DESTRUCTIVE_ARGS = { command: "rm -rf /tmp/x" }
@@ -508,32 +521,42 @@ test("boundary: destructive just above blockThreshold blocks (strict >)", async 
   )
 })
 
-test("boundary: needs_human at exactly routeThreshold toasts (inclusive >=)", async () => {
+test("boundary: high-stakes score at exactly routeThreshold toasts (inclusive >=)", async () => {
   const { input, toasts } = stubInput()
-  routeFetch(() => new Response(choiceBody("route", "needs_human", ROUTE_THRESHOLD), { status: 200 }))
-  const hooks = await plugin(input)
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(choiceBody("route", "needs_human", 0.9), { status: 200 })
+  })
+  // A message that matches exactly one 0.5-weight signal scores exactly 0.5;
+  // gating with routeThreshold=0.5 pins the inclusive `>=`.
+  const hooks = await plugin(input, { routeThreshold: 0.5 })
   const chat = hooks["chat.message"]
   assert.ok(chat)
   await chat(
     { sessionID: "s" },
-    { message: {} as never, parts: [{ type: "text", text: "should I drop the prod table?" } as never] },
+    { message: {} as never, parts: [{ type: "text", text: "please review the production config" } as never] },
   )
   assert.equal(toasts.length, 1)
+  assert.equal(called, false)
 })
 
-test("boundary: needs_human just below routeThreshold does NOT toast", async () => {
+test("boundary: high-stakes score just below routeThreshold does NOT toast", async () => {
   const { input, toasts } = stubInput()
-  routeFetch(() =>
-    new Response(choiceBody("route", "needs_human", ROUTE_THRESHOLD - 1e-6), { status: 200 }),
-  )
-  const hooks = await plugin(input)
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(choiceBody("route", "needs_human", 0.4), { status: 200 })
+  })
+  const hooks = await plugin(input, { routeThreshold: 0.5 + 1e-6 })
   const chat = hooks["chat.message"]
   assert.ok(chat)
   await chat(
     { sessionID: "s" },
-    { message: {} as never, parts: [{ type: "text", text: "hi" } as never] },
+    { message: {} as never, parts: [{ type: "text", text: "please review the production config" } as never] },
   )
   assert.equal(toasts.length, 0)
+  assert.equal(called, false)
 })
 
 test("boundary: compaction at exactly compactThreshold appends (inclusive >=)", async () => {
@@ -592,28 +615,36 @@ test("boundary: severity just below severityThreshold does NOT toast", async () 
   assert.equal(toasts.length, 0)
 })
 
-test("boundary: fileReview at exactly fileReviewThreshold toasts (inclusive >=)", async () => {
+test("boundary: fileReview score at exactly fileReviewThreshold toasts (inclusive >=)", async () => {
   const { input, toasts } = stubInput()
-  routeFetch(() =>
-    new Response(noulBody("security_sensitive", FILE_REVIEW_THRESHOLD), { status: 200 }),
-  )
-  const hooks = await plugin(input)
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(noulBody("security_sensitive", 0.9), { status: 200 })
+  })
+  // `.env` scores exactly 0.9 in the deterministic classifier; gating with
+  // fileReviewThreshold=0.9 pins the inclusive `>=`.
+  const hooks = await plugin(input, { fileReviewThreshold: 0.9 })
   const event = hooks.event
   assert.ok(event)
   await event({ event: { type: "file.edited", properties: { file: ".env" } } as never })
   assert.equal(toasts.length, 1)
+  assert.equal(called, false)
 })
 
-test("boundary: fileReview just below fileReviewThreshold does NOT toast", async () => {
+test("boundary: fileReview score just below fileReviewThreshold does NOT toast", async () => {
   const { input, toasts } = stubInput()
-  routeFetch(() =>
-    new Response(noulBody("security_sensitive", FILE_REVIEW_THRESHOLD - 1e-6), { status: 200 }),
-  )
-  const hooks = await plugin(input)
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(noulBody("security_sensitive", 0.9), { status: 200 })
+  })
+  const hooks = await plugin(input, { fileReviewThreshold: 0.9 + 1e-6 })
   const event = hooks.event
   assert.ok(event)
   await event({ event: { type: "file.edited", properties: { file: ".env" } } as never })
   assert.equal(toasts.length, 0)
+  assert.equal(called, false)
 })
 
 /**
@@ -701,4 +732,57 @@ test("plugin: toastDecisions=true toasts a decision that would otherwise be sile
   )
   // One startup toast + one decision toast.
   assert.equal(toasts.length, 2)
+})
+
+/**
+ * Fail-open latency tests for the blocking hook.
+ *
+ * `tool.execute.before` is awaited by opencode, so its worst case sits in the
+ * main agent loop. A hung provider must fail open after a single timeout: the
+ * hook proceeds, never throws (even on a destructive hint), and never retries.
+ */
+
+test("fail-open: blocking hook proceeds within the timeout bound and does not retry", async () => {
+  let calls = 0
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    calls += 1
+    // Hang until the client's AbortSignal fires, mimicking a stalled provider.
+    return await new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        const error = new Error("aborted")
+        error.name = "AbortError"
+        reject(error)
+      })
+    })
+  }) as typeof fetch
+  const { input } = stubInput()
+  const hooks = await plugin(input, { timeoutMs: 100 })
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  const started = Date.now()
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo hi > x.txt" } })
+  const elapsed = Date.now() - started
+  assert.ok(elapsed < 1000, `blocking hook must fail open within the bound, took ${elapsed}ms`)
+  assert.equal(calls, 1, "the blocking path must not retry after a timeout")
+})
+
+test("fail-open: a destructive hint that times out does NOT throw", async () => {
+  let calls = 0
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    calls += 1
+    return await new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        const error = new Error("aborted")
+        error.name = "AbortError"
+        reject(error)
+      })
+    })
+  }) as typeof fetch
+  const { input } = stubInput()
+  const hooks = await plugin(input, { timeoutMs: 100 })
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  // `rm -rf` is a destructive hint; an unavailable decision must still fail open.
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm -rf /tmp/x" } })
+  assert.equal(calls, 1)
 })

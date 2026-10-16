@@ -26,6 +26,20 @@ export type CallResult =
   | { readonly ok: true; readonly body: unknown }
   | { readonly ok: false; readonly failure: CallFailure }
 
+/**
+ * Per-request budget overrides.
+ *
+ * A blocking hook (`tool.execute.before`) is awaited by opencode, so its worst
+ * case sits in the main loop. Callers there pass `retry: false` so a hung
+ * provider fails open after a single timeout instead of stalling for two.
+ */
+export type CallOptions = {
+  /** Per-attempt timeout (ms); defaults to the client's configured timeout. */
+  readonly timeoutMs?: number
+  /** Whether a transient failure may be retried once; defaults to true. */
+  readonly retry?: boolean
+}
+
 /** Maximum characters in a state string sent to the router. */
 const MAX_STATE_CHARS = 4000
 
@@ -143,17 +157,21 @@ export class SystemOneClient {
    * @param state - Serialized state to evaluate.
    * @param questions - Named questions keyed by the ids used to read answers.
    * @param modelOverride - Optional model override for this call.
+   * @param options - Optional per-request timeout and retry overrides.
    * @returns The parsed response body, or a classified failure.
    */
   async request(
     state: string,
     questions: Record<string, Question>,
     modelOverride?: string,
+    options?: CallOptions,
   ): Promise<CallResult> {
     const baseUrl = this.baseUrl
     const apiKey = this.apiKey
     if (!baseUrl || !apiKey) return { ok: false, failure: { kind: "busy" } }
 
+    const timeoutMs = options?.timeoutMs ?? this.config.timeoutMs
+    const retry = options?.retry ?? true
     const boundedState = truncateState(state)
     const model = modelOverride?.trim() || this.config.model
     const key = this.cacheKey(boundedState, questions, model)
@@ -167,14 +185,14 @@ export class SystemOneClient {
       return { ok: false, failure: { kind: "busy" } }
     }
     try {
-      const first = await this.attempt(baseUrl, apiKey, boundedState, questions, model)
+      const first = await this.attempt(baseUrl, apiKey, boundedState, questions, model, timeoutMs)
       if (first.ok) {
         this.remember(key, first.body)
         return first
       }
-      if (!isTransient(first.failure)) return first
+      if (!retry || !isTransient(first.failure)) return first
       await delay(RETRY_BACKOFF_MS)
-      const second = await this.attempt(baseUrl, apiKey, boundedState, questions, model)
+      const second = await this.attempt(baseUrl, apiKey, boundedState, questions, model, timeoutMs)
       if (second.ok) this.remember(key, second.body)
       return second
     } finally {
@@ -195,6 +213,7 @@ export class SystemOneClient {
     state: string,
     questions: Record<string, Question>,
     model: string,
+    timeoutMs: number,
   ): Promise<CallResult> {
     let response: Response
     try {
@@ -205,7 +224,7 @@ export class SystemOneClient {
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify({ model, state, questions }),
-        signal: AbortSignal.timeout(this.config.timeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       })
     } catch (error) {
       if (isAbortError(error)) return { ok: false, failure: { kind: "timeout" } }

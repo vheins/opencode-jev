@@ -51,12 +51,13 @@ import {
 import {
   classifyNoul,
   classifyRisk,
-  classifyRoute,
   classifySeverity,
 } from "./decisions.ts"
 import type { ChoiceVerdict, Decision, LogLevel, RiskLevel } from "./domain.ts"
 import {
+  classifyFileSensitivity,
   classifyLocally,
+  classifyMessage,
   failurePolicy,
   type ActionCategory,
 } from "./policy.ts"
@@ -72,13 +73,6 @@ const SERVICE = "opencode-jev"
  * change so a cached decision cannot outlive the policy that produced it.
  */
 const POLICY_VERSION = "2"
-
-/** Question id used for the security-sensitive file review. */
-const FILE_REVIEW_QUESTION_ID = "security_sensitive"
-
-/** Instructions for the security-sensitive file review. */
-const FILE_REVIEW_INSTRUCTIONS =
-  "Is this file path security-sensitive or does it need a security review before changes are accepted?"
 
 /** Question id used for the compaction preservation check. */
 const COMPACT_QUESTION_ID = "unrecoverable"
@@ -426,11 +420,17 @@ export default (async (input, options?: PluginOptions) => {
       const local = classifyLocally(hookInput.tool, output.args)
       if (local.kind === "read_only") return
       try {
-        const decision = await classifyRisk(systemOne, {
-          tool: hookInput.tool,
-          args: output.args,
-          localSignal: local.kind === "destructive_hint" ? local.reason : undefined,
-        })
+        const decision = await classifyRisk(
+          systemOne,
+          {
+            tool: hookInput.tool,
+            args: output.args,
+            localSignal: local.kind === "destructive_hint" ? local.reason : undefined,
+          },
+          // Blocking hook: no retry, so worst-case blocking latency is one
+          // timeout (~3s), not two. Fail-open on timeout is preserved.
+          { retry: false },
+        )
         if (decision.kind === "valid") {
           await log("info", "Jev tool risk verdict", {
             tool: hookInput.tool,
@@ -479,22 +479,26 @@ export default (async (input, options?: PluginOptions) => {
       try {
         const text = extractText(output.parts)
         if (!text) return
-        const decision = await classifyRoute(systemOne, { message: text })
-        if (decision.kind !== "valid") {
-          await record("chat.message", summarizeChoice(decision), "log")
-          return
+        // Observe-only: hooks return Promise<void> and cannot reroute a
+        // message, so a per-message Jev call would produce a verdict with no
+        // action. A deterministic local check keeps the advisory at zero cost.
+        const classification = classifyMessage(text)
+        const needsHuman = classification.score >= config.routeThreshold
+        const summary: DecisionSummary = {
+          kind: "valid",
+          decision: needsHuman ? "needs_human" : "code_only",
+          confidence: classification.score,
         }
-        await log("info", "Jev cascade classification (observe-only)", {
-          route: decision.verdict.choice,
-          confidence: decision.verdict.confidence,
-        })
-        const toastsNeedsHuman =
-          decision.verdict.choice === "needs_human" &&
-          decision.verdict.confidence >= config.routeThreshold
-        await record("chat.message", summarizeChoice(decision), toastsNeedsHuman ? "toast" : "log")
-        if (toastsNeedsHuman) {
+        if (needsHuman) {
+          await log("info", "Message flagged high-stakes (deterministic)", {
+            score: classification.score,
+            reason: classification.reason,
+          })
+        }
+        await record("chat.message", summary, needsHuman ? "toast" : "log", classification.reason)
+        if (needsHuman) {
           await toast(
-            `Message classified needs_human (confidence ${decision.verdict.confidence.toFixed(2)}).`,
+            `Message looks high-stakes (score ${classification.score.toFixed(2)}).`,
             "warning",
             "Jev cascade classification",
           )
@@ -569,22 +573,22 @@ export default (async (input, options?: PluginOptions) => {
           }
           case "file.edited": {
             const file = event.properties.file
-            const decision = await classifyNoul(
-              systemOne,
-              FILE_REVIEW_QUESTION_ID,
-              FILE_REVIEW_INSTRUCTIONS,
-              { file },
-            )
-            if (decision.kind !== "valid") {
-              await record("event:file.edited", summarizeNoul(decision), "log")
-              return
+            // Demoted from a per-edit Jev call to a deterministic path check:
+            // the advisory is unchanged, but there is no network round trip.
+            const sensitivity = classifyFileSensitivity(file)
+            const sensitive = sensitivity.score >= config.fileReviewThreshold
+            const summary: DecisionSummary = {
+              kind: "valid",
+              decision: sensitive ? "security_sensitive" : "ordinary",
+              confidence: sensitivity.score,
             }
-            await log("info", "Jev file edit review judgment", {
-              file,
-              probability: decision.verdict,
-            })
-            const sensitive = decision.verdict >= config.fileReviewThreshold
-            await record("event:file.edited", summarizeNoul(decision), sensitive ? "toast" : "log")
+            if (sensitive) {
+              await log("info", "Security-sensitive file edited (deterministic)", {
+                file,
+                reason: sensitivity.reason,
+              })
+            }
+            await record("event:file.edited", summary, sensitive ? "toast" : "log", file)
             if (sensitive) {
               await toast(`Security-sensitive file edited: ${file}`, "warning", "Jev file review")
             }

@@ -102,6 +102,101 @@ export function classifyLocally(tool: string, args: unknown): LocalClassificatio
 }
 
 /**
+ * Path/extension/keyword patterns that mark a file as security-sensitive, with
+ * a deterministic weight in `[0, 1]`.
+ *
+ * This replaces the per-edit remote Jev call with a deterministic check: an
+ * edit to a matching path still raises the same advisory, but at zero network
+ * cost and with no model round trip. The list targets secrets, credentials,
+ * private keys, and security-gating configuration. Strong signals (secret
+ * files, key material, CI auth) score 0.9; weaker hints (a generic `secret`
+ * directory) score 0.5, so the caller's `fileReviewThreshold` stays meaningful.
+ */
+const SENSITIVE_FILE_SIGNALS: ReadonlyArray<{ readonly weight: number; readonly pattern: RegExp }> = [
+  { weight: 0.9, pattern: /(^|[./\\-])\.env(\.|$)/i },
+  { weight: 0.9, pattern: /(^|[./\\-])(\.npmrc|\.netrc|\.git-credentials|\.pgpass|\.htpasswd)(\.|$)/i },
+  { weight: 0.9, pattern: /(^|[./\\-])id_(rsa|dsa|ecdsa|ed25519)(\.pub)?(\.|$)/i },
+  { weight: 0.9, pattern: /\.(pem|key|crt|cer|p12|pfx|jks|keystore)(\.|$)/i },
+  { weight: 0.9, pattern: /(^|[./\\-])\.(ssh|aws|gnupg)([./\\-]|$)/i },
+  { weight: 0.9, pattern: /(^|[./\\-])(password|passwd|private[_-]?key|access[_-]?key)([./\\-]|$)/i },
+  { weight: 0.9, pattern: /(^|[./\\-])(\.github[./\\-]workflows|\.gitlab-ci\.ya?ml|Jenkinsfile)([./\\-]|$)/i },
+  { weight: 0.5, pattern: /(^|[./\\-])(credentials?|secrets?)(\.|$)/i },
+]
+
+/** The result of the deterministic file-sensitivity check. */
+export type FileSensitivity = { readonly score: number; readonly reason: string }
+
+/**
+ * Classify whether an edited file path is security-sensitive, locally.
+ *
+ * Deterministic and network-free, so the `file.edited` handler can keep its
+ * user-visible advisory without paying for a Jev call on every edit. The
+ * returned score is gated by the caller's `fileReviewThreshold`.
+ *
+ * @param file - The edited file path.
+ * @returns The graded score in `[0, 1]` and the matching reason.
+ */
+export function classifyFileSensitivity(file: string): FileSensitivity {
+  const normalized = file.trim()
+  if (normalized === "") return { score: 0, reason: "empty path" }
+  let score = 0
+  let reason = "no security-sensitive pattern matched"
+  for (const signal of SENSITIVE_FILE_SIGNALS) {
+    if (signal.pattern.test(normalized)) {
+      score = Math.max(score, signal.weight)
+      if (reason === "no security-sensitive pattern matched") {
+        reason = `path matches ${signal.pattern.source}`
+      }
+    }
+  }
+  return { score, reason }
+}
+
+/** The result of the deterministic message-needs-human check. */
+export type MessageClassification = { readonly score: number; readonly reason: string }
+
+/**
+ * High-stakes message signals and their deterministic weights.
+ *
+ * `chat.message` is observe-only (hooks return `Promise<void>` and cannot
+ * inject or reroute a message), so the per-message Jev round trip produced a
+ * verdict with no action. This deterministic check keeps the user-visible
+ * advisory at zero network cost: a graded score in `[0, 1]` that the caller
+ * gates with `routeThreshold`.
+ */
+const MESSAGE_SIGNALS: ReadonlyArray<{ readonly weight: number; readonly pattern: RegExp }> = [
+  { weight: 0.9, pattern: /\b(delete|drop|truncate)\b[^\n]*\b(prod|production|database|table|data)\b/i },
+  { weight: 0.9, pattern: /\brm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i },
+  { weight: 0.9, pattern: /\bforce[-\s]?push\b/i },
+  { weight: 0.9, pattern: /\b(deploy|release|ship|rollback)\b[^\n]*\b(prod|production|live)\b/i },
+  { weight: 0.9, pattern: /\b(rotate|revoke)\b[^\n]*\b(secret|key|credential|token|access)s?\b/i },
+  { weight: 0.5, pattern: /\bprod(uction)?\b/i },
+  { weight: 0.5, pattern: /\b(secret|password|credential|api[_-]?key|private[_-]?key)\b/i },
+  { weight: 0.5, pattern: /\b(should i|is it safe|do you recommend|which is better|your call)\b/i },
+  { weight: 0.5, pattern: /\b(approve|approval|sign[-\s]?off|permission)\b/i },
+  { weight: 0.5, pattern: /\bmigrat(e|ion)\b/i },
+  { weight: 0.5, pattern: /\b(breaking change|backward[-\s]?incompat)/i },
+]
+
+/**
+ * Score whether a user message needs a human decision, locally and network-free.
+ *
+ * @param text - The message text.
+ * @returns The graded score in `[0, 1]` and the matching reason.
+ */
+export function classifyMessage(text: string): MessageClassification {
+  let score = 0
+  let reason = "no high-stakes signal matched"
+  for (const signal of MESSAGE_SIGNALS) {
+    if (signal.pattern.test(text)) {
+      score += signal.weight
+      if (reason === "no high-stakes signal matched") reason = `text matches ${signal.pattern.source}`
+    }
+  }
+  return { score: Math.min(1, score), reason }
+}
+
+/**
  * Map a Jev risk label to an action category.
  *
  * @param risk - The validated risk verdict label.

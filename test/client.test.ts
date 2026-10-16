@@ -80,6 +80,33 @@ test("request: retries a 500 at most once, then gives up", async () => {
   assert.equal(calls, 2, "transient failure is retried exactly once")
 })
 
+test("request: retry:false disables the retry (blocking-path budget)", async () => {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    return new Response("boom", { status: 500 })
+  }) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+  const result = await client.request("state", QUESTIONS, undefined, { retry: false })
+  assert.equal(result.ok, false)
+  assert.equal(calls, 1, "the blocking path must not retry a transient failure")
+})
+
+test("request: retry:false does not retry a timeout either", async () => {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    const error = new Error("aborted")
+    error.name = "AbortError"
+    throw error
+  }) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+  const result = await client.request("state", QUESTIONS, undefined, { retry: false })
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.equal(result.failure.kind, "timeout")
+  assert.equal(calls, 1, "a timeout on the blocking path must not be retried")
+})
+
 test("request: recovers when the single retry succeeds", async () => {
   let calls = 0
   globalThis.fetch = (async () => {

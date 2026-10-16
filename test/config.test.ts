@@ -13,7 +13,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { loadConfig, parseBoolean, parseCount, parseThreshold } from "../src/config.ts"
+import { loadConfig, parseBoolean, parseCount, parsePositiveInt, parseThreshold } from "../src/config.ts"
 
 test("loadConfig: unset JEV_BASE_URL disables Jev with missing-base-url", () => {
   const { config, disabledReason } = loadConfig({}, { JEV_API_KEY: "secret" }, "secret")
@@ -294,4 +294,52 @@ test("loadConfig: wrong-typed decision-log options are ignored and warn", () => 
     warnings.map((w) => w.field).sort(),
     ["decisionLogBackups", "decisionLogMaxBytes", "toastDecisions"],
   )
+})
+
+test("loadConfig: timeoutMs defaults to 3000 when nothing is set", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.timeoutMs, 3_000)
+})
+
+test("loadConfig: JEV_TIMEOUT_MS env overrides the default timeout", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_TIMEOUT_MS: "1500" },
+    "k",
+  )
+  assert.equal(config.timeoutMs, 1_500)
+})
+
+test("loadConfig: a timeoutMs option overrides the env (options > env)", () => {
+  const { config } = loadConfig(
+    { timeoutMs: 750 },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_TIMEOUT_MS: "1500" },
+    "k",
+  )
+  assert.equal(config.timeoutMs, 750)
+})
+
+test("loadConfig: an invalid timeout falls back to the default and warns", () => {
+  const { config, warnings } = loadConfig(
+    { timeoutMs: -1 },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1", JEV_TIMEOUT_MS: "0" },
+    "k",
+  )
+  assert.equal(config.timeoutMs, 3_000, "a non-positive timeout must fall back to the default")
+  assert.equal(warnings.length, 1)
+  assert.equal(warnings[0]?.field, "timeoutMs")
+})
+
+test("parsePositiveInt: positive integers pass; missing/zero/negative/non-integer fall back", () => {
+  assert.equal(parsePositiveInt("2000", 3000), 2000)
+  assert.equal(parsePositiveInt(undefined, 3000), 3000)
+  assert.equal(parsePositiveInt("", 3000), 3000)
+  assert.equal(parsePositiveInt("0", 3000), 3000)
+  assert.equal(parsePositiveInt("-5", 3000), 3000)
+  assert.equal(parsePositiveInt("1.5", 3000), 3000)
+  assert.equal(parsePositiveInt("abc", 3000), 3000)
 })
