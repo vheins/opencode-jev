@@ -17,21 +17,23 @@ The plugin can only ever **add a block** to a tool call. It never auto-allows, s
 ```mermaid
 flowchart TD
   A["User message / tool call / event"] --> B["Hook intercepts"]
-  B --> C["tool.execute.before / chat.message / compacting / event / jev_decide"]
-  C --> D{"Key and base URL set?"}
-  D -->|No| E["No-op + warn once"]
-  D -->|Yes| F["POST /v1/systemone via router provider"]
-  F --> G{"Valid answer within timeout?"}
-  G -->|No| H["invalid / unavailable -> per-category policy"]
-  G -->|Yes| I["Typed verdict: choice / score / noul"]
-  I --> J{"Branch on verdict"}
-  J -->|destructive + above threshold| K["Block tool (throw)"]
-  J -->|alert level| L["Toast + log"]
-  J -->|otherwise| M["No action; native flow decides"]
-  H --> M
+  B --> C["tool.execute.before / compacting / session.error / jev_decide (Jev)"]
+  B --> D["chat.message / file.edited (deterministic local)"]
+  C --> E{"Key and base URL set?"}
+  E -->|No| F["No-op + warn once"]
+  E -->|Yes| G["POST /v1/systemone via router provider"]
+  G --> H{"Valid answer within timeout?"}
+  H -->|No| I["invalid / unavailable -> per-category policy (fail-open)"]
+  H -->|Yes| J["Typed verdict: choice / score / noul"]
+  J --> K{"Branch on verdict"}
+  K -->|destructive + above threshold| L["Block tool (throw)"]
+  K -->|alert level| M["Toast + log"]
+  K -->|otherwise| N["No action; native flow decides"]
+  I --> N
+  D --> M
 ```
 
-Verdict types map to hooks in the [Hook / event map](#hook--event-map): `choice` drives risk, routing, and severity labels; `noul` drives compaction and file review probabilities; `score` is available through the `tool.jev_decide` custom tool.
+Verdict types map to hooks in the [Hook / event map](#hook--event-map): `choice` drives risk and severity labels; `noul` drives the compaction probability; `score` is available through the `tool.jev_decide` custom tool. `chat.message` and `file.edited` are scored by deterministic local checks, so they make no Jev call.
 
 ### With and without the plugin
 
@@ -124,16 +126,17 @@ The JEV key and the base URL are both required; if neither source supplies one, 
 | `baseUrl` | `JEV_BASE_URL` | — (required) | Router pass-through route for System One judgments. **No default host is shipped**; an unset or blank value disables Jev (no-op + warn) rather than calling any host. |
 | `model` | `JEV_MODEL` | `oc/jev-1.13-free` | Jev model id. |
 | `blockThreshold` | `JEV_BLOCK_THRESHOLD` | `0.85` | Block a destructive tool call when confidence exceeds this value. |
-| `routeThreshold` | `JEV_ROUTE_THRESHOLD` | `0.8` | Toast when `chat.message` classifies a message as `needs_human` at or above this confidence. |
+| `routeThreshold` | `JEV_ROUTE_THRESHOLD` | `0.8` | Toast when the deterministic `chat.message` score reaches this value. |
 | `severityThreshold` | `JEV_SEVERITY_THRESHOLD` | `0.8` | Toast when a `session.error` severity resolves to `real_bug`/`fatal` at or above this confidence. |
 | `compactThreshold` | `JEV_COMPACT_THRESHOLD` | `0.75` | Append a preservation reminder to compaction context at or above this probability. |
-| `fileReviewThreshold` | `JEV_FILE_REVIEW_THRESHOLD` | `0.8` | Toast when an edited file is judged security-sensitive at or above this probability. |
+| `fileReviewThreshold` | `JEV_FILE_REVIEW_THRESHOLD` | `0.8` | Toast when the deterministic `file.edited` sensitivity score reaches this value. |
+| `timeoutMs` | `JEV_TIMEOUT_MS` | `3000` | Per-request timeout (ms) for a Jev call. Must be a positive integer; an invalid value is ignored and warned. |
 | `decisionLogPath` | `JEV_DECISION_LOG` | `~/.config/opencode/jev-decisions.log` | Newline-delimited JSON decision log. An empty string or `off` disables logging. |
 | `decisionLogMaxBytes` | `JEV_DECISION_LOG_MAX_BYTES` | `1000000` | Rotate the decision log once it reaches this many bytes. |
 | `decisionLogBackups` | `JEV_DECISION_LOG_BACKUPS` | `3` | Number of rotated copies to keep (`<path>.1` .. `<path>.N`). |
 | `toastDecisions` | `JEV_TOAST_DECISIONS` | `false` | Toast **every** decision (not just the three default toasts). |
 
-Thresholds are per category; there is no single global threshold across unrelated decisions. A value outside `[0, 1]` is ignored and the default is used, so a typo cannot widen a guardrail silently. A wrong-typed option is likewise ignored (the environment value then applies) and logs a one-time warning naming the field, never its value. The decision-log fields are validated the same way: `decisionLogMaxBytes` and `decisionLogBackups` must be non-negative integers, and `toastDecisions` must be a boolean.
+Thresholds are per category; there is no single global threshold across unrelated decisions. A value outside `[0, 1]` is ignored and the default is used, so a typo cannot widen a guardrail silently. A wrong-typed option is likewise ignored (the environment value then applies) and logs a one-time warning naming the field, never its value. The decision-log fields are validated the same way: `decisionLogMaxBytes` and `decisionLogBackups` must be non-negative integers, and `toastDecisions` must be a boolean. `timeoutMs` must be a positive integer; a non-positive or non-integer value is ignored and warned.
 
 ### Decision observability
 
@@ -153,11 +156,11 @@ Key resolution order: the `apiKey` option, then the `JEV_API_KEY` environment va
 
 | Hook or event | Jev question | Behavior |
 | --- | --- | --- |
-| `tool.execute.before` | Choice: `read_only` \| `mutating` \| `destructive` | Blocks (throws) when the verdict is `destructive` and confidence > `JEV_BLOCK_THRESHOLD`. Known read-only tools skip the call. It never auto-allows; opencode's native flow still decides everything else. |
-| `chat.message` | Choice: `code_only` \| `needs_model` \| `needs_human` | Classifies each user message, logs the verdict, and raises a TUI toast on a confident `needs_human`. This hook is **observe-only**: it cannot reroute the message, so the verdict is a classification, not routing. |
+| `tool.execute.before` | Choice: `read_only` \| `mutating` \| `destructive` | Blocks (throws) when the verdict is `destructive` and confidence > `JEV_BLOCK_THRESHOLD`. Known read-only tools skip the call. Runs on a tight budget: no retry, so worst-case blocking latency is one `timeoutMs` (~3s). It never auto-allows; opencode's native flow still decides everything else. |
+| `chat.message` | Deterministic local score | Scores each user message for high-stakes signals (destructive verbs on production data, secrets, approvals, migrations) with **no Jev call**. Raises a TUI toast when the score reaches `JEV_ROUTE_THRESHOLD`. This hook is **observe-only**: it cannot reroute the message. |
 | `experimental.session.compacting` | Noul: "does this session hold unrecoverable decisions?" | Pushes a preservation reminder line into the summary context when the probability is high. Never replaces the compaction prompt. |
 | `event` → `session.error` | Choice: `transient` \| `real_bug` \| `fatal` | Logs the severity; raises a toast on a confident non-transient verdict. A `MessageAbortedError` is ignored. |
-| `event` → `file.edited` | Noul: "is this path security-sensitive / needs review?" | Logs a high verdict and raises a review toast. |
+| `event` → `file.edited` | Deterministic local path check | Scores the edited path for security-sensitive patterns (`.env`, key material, CI auth) with **no Jev call**, and raises a review toast when the score reaches `JEV_FILE_REVIEW_THRESHOLD`. |
 | `tool.jev_decide` (custom tool) | Choice / Score / Noul over arbitrary state | Exposes Jev directly to the agent; returns the typed answer as JSON. |
 
 The plugin does **not** register a `permission.ask` handler. That hook is declared in the plugin types but is not triggered by opencode 1.19.0, so any handler would be dead code that appears to arbitrate permissions without doing so.
@@ -170,7 +173,8 @@ The plugin is designed so it can never break opencode's flow and never weakens t
 - **Invalid or unavailable verdict** — an absent, malformed, contradictory, out-of-range, timed-out, or disabled answer is reported as `invalid`/`unavailable` and carries no verdict. It is never treated as permission to proceed.
 - **Per-category failure policy** — a non-actionable verdict for a high-impact action (destructive or high-impact category) surfaces a warning; low-risk categories stay silent. Neither case relaxes opencode's native approval flow.
 - **Block only** — `tool.execute.before` either throws (deny) or returns (defer). The plugin cannot auto-allow, so a model verdict never bypasses opencode's permission controls.
-- **Bounded network** — each request carries an `AbortSignal.timeout` and at most one retry, and only for transient failures (timeouts, connection errors, `429`, and `5xx`). A deterministic `4xx` is never retried.
+- **Never blocks the loop** — a Jev answer can only *add* a block; it can never stall the main agent loop. The blocking hook runs on a tight budget with no retry, so a hung provider fails open after one `timeoutMs` (~3s), including when the local hint is destructive.
+- **Bounded network** — each request carries an `AbortSignal.timeout` (default 3000ms, configurable). Non-blocking hooks retry at most once, and only for transient failures (timeouts, connection errors, `429`, and `5xx`); the blocking `tool.execute.before` hook never retries. A deterministic `4xx` is never retried.
 - **No secret leakage** — the API key and request bodies are never written to logs or the decision log.
 - **Validated answers** — a `choice` verdict must carry a known label, a finite confidence in `[0, 1]`, and a probability map that does not contradict the selected label. A `noul` verdict must carry a probability in `[0, 1]`.
 
