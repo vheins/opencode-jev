@@ -27,6 +27,18 @@ test("classifyLocally: known read-only tools skip Jev", () => {
   }
 })
 
+test("classifyLocally: low-risk meta tools (todowrite, task-read) skip Jev", () => {
+  for (const tool of ["todowrite", "todoread", "task-read"]) {
+    assert.equal(classifyLocally(tool, {}).kind, "read_only", `tool=${tool}`)
+  }
+})
+
+test("classifyLocally: mutating and dispatch tools stay on the network path", () => {
+  for (const tool of ["edit", "write", "bash", "execute", "task", "memory-write"]) {
+    assert.equal(classifyLocally(tool, { command: "echo hi" }).kind, "unknown", `tool=${tool}`)
+  }
+})
+
 test("classifyLocally: rm -rf is a destructive hint", () => {
   const result = classifyLocally("bash", { command: "rm -rf /tmp/x" })
   assert.equal(result.kind, "destructive_hint")

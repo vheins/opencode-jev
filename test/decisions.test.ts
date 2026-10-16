@@ -103,6 +103,32 @@ test("classifyRisk: a provider failure is unavailable with its reason", async ()
   if (decision.kind === "unavailable") assert.equal(decision.reason, "timeout")
 })
 
+test("classifyRisk: a provider failure carries its diagnostic detail into the decision", async () => {
+  const decision = await classifyRisk(
+    stub({ ok: false, failure: { kind: "provider", status: 502, detail: "HTTP 502: bad gateway" } }),
+    { tool: "bash" },
+  )
+  assert.equal(decision.kind, "unavailable")
+  if (decision.kind === "unavailable") {
+    assert.equal(decision.reason, "provider")
+    assert.equal(decision.detail, "HTTP 502: bad gateway")
+  }
+})
+
+test("classifyNoul: a provider failure carries its diagnostic detail", async () => {
+  const decision = await classifyNoul(
+    stub({ ok: false, failure: { kind: "circuit_open", detail: "circuit open; last: HTTP 503" } }),
+    "q",
+    "?",
+    {},
+  )
+  assert.equal(decision.kind, "unavailable")
+  if (decision.kind === "unavailable") {
+    assert.equal(decision.reason, "circuit_open")
+    assert.equal(decision.detail, "circuit open; last: HTTP 503")
+  }
+})
+
 test("classifyRisk: a non-object body is invalid", async () => {
   const decision = await classifyRisk(stub(OK("not json")), { tool: "bash" })
   assert.equal(decision.kind, "invalid")

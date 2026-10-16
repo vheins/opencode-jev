@@ -83,7 +83,9 @@ async function askChoice<T extends string>(
 ): Promise<Decision<ChoiceVerdict<T>>> {
   const questions: Record<string, Question> = { [id]: choice(instructions, criteria) }
   const result = await requester.request(safeStringify(state), questions, undefined, options)
-  if (!result.ok) return unavailable<ChoiceVerdict<T>>(result.failure.kind)
+  if (!result.ok) {
+    return unavailable<ChoiceVerdict<T>>(result.failure.kind, result.failure.detail)
+  }
   const parsed = parseResponse(result.body)
   if (!parsed) return invalid<ChoiceVerdict<T>>("wrong-type")
   const validated = validateChoice(parsed.answers[id], allowed)
@@ -182,7 +184,7 @@ export async function classifyNoul(
 ): Promise<Decision<number>> {
   const questions: Record<string, Question> = { [id]: noul(instructions) }
   const result = await requester.request(safeStringify(state), questions, undefined, options)
-  if (!result.ok) return unavailable<number>(result.failure.kind)
+  if (!result.ok) return unavailable<number>(result.failure.kind, result.failure.detail)
   const parsed = parseResponse(result.body)
   if (!parsed) return invalid<number>("wrong-type")
   const validated = validateNoul(parsed.answers[id])

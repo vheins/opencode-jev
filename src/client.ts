@@ -14,12 +14,19 @@ import type { Question } from "@typesafe-ai/sdk"
 
 import type { Config } from "./config.ts"
 
-/** How a Jev call failed, mapped to a failure policy. */
+/**
+ * How a Jev call failed, mapped to a failure policy.
+ *
+ * `detail` carries a short, redacted, bounded diagnostic (e.g. a provider's
+ * HTTP status and response-body snippet) so a failure is observable after the
+ * fact without ever exposing the key or an unbounded payload.
+ */
 export type CallFailure =
-  | { readonly kind: "timeout" }
-  | { readonly kind: "transport" }
-  | { readonly kind: "provider"; readonly status: number }
-  | { readonly kind: "busy" }
+  | { readonly kind: "timeout"; readonly detail?: string }
+  | { readonly kind: "transport"; readonly detail?: string }
+  | { readonly kind: "provider"; readonly status: number; readonly detail?: string }
+  | { readonly kind: "busy"; readonly detail?: string }
+  | { readonly kind: "circuit_open"; readonly detail?: string }
 
 /** A successful or failed Jev call. */
 export type CallResult =
@@ -45,6 +52,20 @@ const MAX_STATE_CHARS = 4000
 
 /** Backoff before the single transient retry (ms). */
 const RETRY_BACKOFF_MS = 250
+
+/** Maximum characters of a provider response body kept for diagnostics. */
+export const MAX_BODY_SNIPPET_CHARS = 200
+
+/** Consecutive provider failures that open the short-TTL circuit. */
+export const FAILURE_THRESHOLD = 3
+
+/**
+ * Default how long (ms) the circuit stays open after a provider failure streak.
+ *
+ * Kept short so a transient outage recovers quickly while a down provider is
+ * not hammered by every hook call in the meantime.
+ */
+export const DEFAULT_FAILURE_TTL_MS = 5_000
 
 /**
  * A counting semaphore bounding in-flight Jev requests.
@@ -92,6 +113,22 @@ export function errorMessage(error: unknown): string {
   return String(error)
 }
 
+/**
+ * Reduce a provider response body to a bounded, single-line, redacted snippet.
+ *
+ * The snippet is diagnostic only: it is clipped to
+ * {@link MAX_BODY_SNIPPET_CHARS} characters, collapsed to one line, and has any
+ * occurrence of the API key removed so a body echo can never leak the secret.
+ *
+ * @param text - The raw response body text.
+ * @param secret - The API key to redact, when present.
+ * @returns A bounded, redacted, single-line snippet.
+ */
+export function bodySnippet(text: string, secret?: string): string {
+  const redacted = secret && secret.length > 0 ? text.split(secret).join("[redacted]") : text
+  return redacted.slice(0, MAX_BODY_SNIPPET_CHARS).replace(/\s+/g, " ").trim()
+}
+
 /** Cap a serialized state string so no request body grows unbounded. */
 export function truncateState(value: string, max = MAX_STATE_CHARS): string {
   return value.length > max ? value.slice(0, max) : value
@@ -108,8 +145,8 @@ function isAbortError(error: unknown): boolean {
 }
 
 /** Classify an HTTP status into a call failure. */
-function failureForStatus(status: number): CallFailure {
-  return { kind: "provider", status }
+function failureForStatus(status: number, detail?: string): CallFailure {
+  return detail === undefined ? { kind: "provider", status } : { kind: "provider", status, detail }
 }
 
 /**
@@ -117,13 +154,17 @@ function failureForStatus(status: number): CallFailure {
  *
  * The client caps concurrent requests, applies a per-attempt timeout, retries
  * a transient failure at most once, and caches only results whose inputs and
- * policy version are equivalent.
+ * policy version are equivalent. A short-TTL circuit breaker trips after a
+ * streak of provider failures so a down provider is not hit by every call.
  */
 export class SystemOneClient {
   private readonly config: Config
   private readonly policyVersion: string
   private readonly semaphore: Semaphore
   private readonly cache = new Map<string, { readonly at: number; readonly body: unknown }>()
+  private consecutiveFailures = 0
+  private circuitOpenUntil = 0
+  private lastFailureDetail: string | undefined
 
   /**
    * @param config - Resolved configuration (base URL, key, model, bounds).
@@ -181,22 +222,67 @@ export class SystemOneClient {
       return { ok: true, body: cached.body }
     }
 
+    // Short-TTL circuit breaker: after a streak of provider failures, fail open
+    // fast (no network) until the window elapses, so a down provider is not hit
+    // by every hook call.
+    const now = Date.now()
+    if (now < this.circuitOpenUntil) {
+      const detail =
+        this.lastFailureDetail === undefined
+          ? "circuit open after repeated provider failures"
+          : `circuit open after repeated provider failures; last: ${this.lastFailureDetail}`
+      return { ok: false, failure: { kind: "circuit_open", detail } }
+    }
+
     if (!this.semaphore.tryAcquire()) {
       return { ok: false, failure: { kind: "busy" } }
     }
     try {
       const first = await this.attempt(baseUrl, apiKey, boundedState, questions, model, timeoutMs)
       if (first.ok) {
+        this.recordSuccess()
         this.remember(key, first.body)
         return first
       }
-      if (!retry || !isTransient(first.failure)) return first
+      if (!retry || !isTransient(first.failure)) {
+        this.recordFailure(first.failure)
+        return first
+      }
       await delay(RETRY_BACKOFF_MS)
       const second = await this.attempt(baseUrl, apiKey, boundedState, questions, model, timeoutMs)
-      if (second.ok) this.remember(key, second.body)
+      if (second.ok) {
+        this.recordSuccess()
+        this.remember(key, second.body)
+      } else {
+        this.recordFailure(second.failure)
+      }
       return second
     } finally {
       this.semaphore.release()
+    }
+  }
+
+  /** Reset the failure streak after a successful call. */
+  private recordSuccess(): void {
+    this.consecutiveFailures = 0
+    this.circuitOpenUntil = 0
+    this.lastFailureDetail = undefined
+  }
+
+  /**
+   * Advance the failure streak and trip the circuit once it reaches the bound.
+   *
+   * Only provider/transport/timeout failures count: `busy` is a local
+   * concurrency limit, not a provider-health signal.
+   *
+   * @param failure - The failure just observed.
+   */
+  private recordFailure(failure: CallFailure): void {
+    if (failure.kind === "busy") return
+    this.consecutiveFailures += 1
+    this.lastFailureDetail = describeFailure(failure)
+    if (this.consecutiveFailures >= FAILURE_THRESHOLD) {
+      this.circuitOpenUntil = Date.now() + DEFAULT_FAILURE_TTL_MS
     }
   }
 
@@ -227,16 +313,37 @@ export class SystemOneClient {
         signal: AbortSignal.timeout(timeoutMs),
       })
     } catch (error) {
-      if (isAbortError(error)) return { ok: false, failure: { kind: "timeout" } }
-      return { ok: false, failure: { kind: "transport" } }
+      if (isAbortError(error)) {
+        return { ok: false, failure: { kind: "timeout", detail: `no response within ${timeoutMs}ms` } }
+      }
+      return { ok: false, failure: { kind: "transport", detail: bodySnippet(errorMessage(error)) } }
     }
-    if (!response.ok) return { ok: false, failure: failureForStatus(response.status) }
+    if (!response.ok) {
+      // Capture a bounded, redacted snippet of the provider's error body so a
+      // failure is diagnosable from the decision log (status + why).
+      const snippet = await response
+        .text()
+        .then((text) => bodySnippet(text, apiKey))
+        .catch(() => "")
+      const detail = snippet === "" ? `HTTP ${response.status}` : `HTTP ${response.status}: ${snippet}`
+      return { ok: false, failure: failureForStatus(response.status, detail) }
+    }
     try {
       return { ok: true, body: await response.json() }
     } catch {
-      return { ok: false, failure: { kind: "transport" } }
+      return { ok: false, failure: { kind: "transport", detail: "response was not valid JSON" } }
     }
   }
+}
+
+/** Render a failure into a short, redacted, bounded diagnostic string. */
+function describeFailure(failure: CallFailure): string {
+  if (failure.kind === "provider") {
+    return failure.detail ?? `HTTP ${failure.status}`
+  }
+  if (failure.kind === "busy") return "busy"
+  if (failure.kind === "circuit_open") return failure.detail ?? "circuit open"
+  return failure.detail ?? failure.kind
 }
 
 /** Whether a failure is worth a single retry. */

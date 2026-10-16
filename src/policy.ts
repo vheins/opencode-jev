@@ -31,10 +31,13 @@ export type LocalClassification =
 export type FailurePolicy = "ignore" | "warn"
 
 /**
- * Tool ids that only read or inspect state.
+ * Tool ids that only read or inspect state, plus low-risk meta tools.
  *
  * These are skipped without a Jev call: the deterministic answer is already
- * known, and a network round trip would only add latency.
+ * known, and a network round trip would only add latency. `todowrite` and
+ * `task-read` are local bookkeeping/read tools that cannot cause irreversible
+ * loss; the dispatch tool `task` and every mutating tool (`edit`, `write`,
+ * `bash`, `execute`, `memory-write`) stay on the network path.
  */
 const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "read",
@@ -42,6 +45,8 @@ const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "glob",
   "grep",
   "todoread",
+  "todowrite",
+  "task-read",
   "webfetch",
 ])
 

@@ -87,6 +87,7 @@ export type UnavailableReason =
   | "transport"
   | "provider"
   | "busy"
+  | "circuit_open"
 
 /** Why a returned Jev answer was rejected as unusable. */
 export type InvalidReason =
@@ -108,7 +109,7 @@ export type Decision<T> =
   | { readonly kind: "valid"; readonly verdict: T }
   | { readonly kind: "abstain"; readonly verdict: T; readonly confidence: number }
   | { readonly kind: "invalid"; readonly reason: InvalidReason }
-  | { readonly kind: "unavailable"; readonly reason: UnavailableReason }
+  | { readonly kind: "unavailable"; readonly reason: UnavailableReason; readonly detail?: string }
 
 /** A validated System One answer envelope. */
 export type ParsedResponse = {

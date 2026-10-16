@@ -136,7 +136,9 @@ function describeDecision(decision: RiskDecision): string {
     case "invalid":
       return `invalid:${decision.reason}`
     case "unavailable":
-      return `unavailable:${decision.reason}`
+      return decision.detail === undefined
+        ? `unavailable:${decision.reason}`
+        : `unavailable:${decision.reason} (${decision.detail})`
     case "abstain":
       return `abstain:${decision.confidence.toFixed(2)}`
     case "valid":

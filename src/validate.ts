@@ -182,10 +182,13 @@ export function classifyConfidence<T extends string>(
  * Build an unavailable decision from a reason.
  *
  * @param reason - Why no answer could be obtained.
+ * @param detail - Optional bounded, redacted diagnostic (e.g. HTTP status + body snippet).
  * @returns An unavailable decision.
  */
-export function unavailable<T>(reason: UnavailableReason): Decision<T> {
-  return { kind: "unavailable", reason }
+export function unavailable<T>(reason: UnavailableReason, detail?: string): Decision<T> {
+  return detail === undefined
+    ? { kind: "unavailable", reason }
+    : { kind: "unavailable", reason, detail }
 }
 
 /**

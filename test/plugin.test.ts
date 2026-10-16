@@ -786,3 +786,61 @@ test("fail-open: a destructive hint that times out does NOT throw", async () => 
   await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm -rf /tmp/x" } })
   assert.equal(calls, 1)
 })
+
+test("tool.execute.before: low-risk meta tools (todowrite, task-read) never call the provider", async () => {
+  const { input } = stubInput()
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(choiceBody("risk", "mutating", 0.9), { status: 200 })
+  })
+  const hooks = await plugin(input)
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  for (const tool of ["todowrite", "task-read"]) {
+    await before({ tool, sessionID: "s", callID: "c" }, { args: {} })
+  }
+  assert.equal(called, false, "low-risk meta tools must skip the network call")
+})
+
+test("tool.execute.before: the dispatch `task` tool stays on the network path", async () => {
+  const { input } = stubInput()
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(choiceBody("risk", "mutating", 0.9), { status: 200 })
+  })
+  const hooks = await plugin(input)
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await before({ tool: "task", sessionID: "s", callID: "c" }, { args: { description: "do work" } })
+  assert.equal(called, true, "the dispatch tool can mutate and must be classified remotely")
+})
+
+test("plugin: a provider failure is logged with its HTTP status and no secret", async () => {
+  const logDir = await mkdtemp(join(tmpdir(), "jev-plugin-fail-"))
+  try {
+    const logPath = join(logDir, "decisions.log")
+    const secret = "sk-provider-fail-secret"
+    process.env = {
+      ...originalEnv,
+      JEV_API_KEY: secret,
+      JEV_BASE_URL: "https://router.example/v1/systemone",
+      JEV_DECISION_LOG: logPath,
+    }
+    const { input } = stubInput()
+    globalThis.fetch = (async () =>
+      new Response(`upstream down for ${secret}`, { status: 503 })) as typeof fetch
+    const hooks = await plugin(input)
+    const before = hooks["tool.execute.before"]
+    assert.ok(before)
+    await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo hi" } })
+    const raw = await readFile(logPath, "utf8")
+    const entry = JSON.parse(raw.split("\n").filter(Boolean)[0] ?? "{}") as Record<string, unknown>
+    assert.equal(entry.kind, "unavailable")
+    assert.match(String(entry.detail), /HTTP 503/)
+    assert.equal(raw.includes(secret), false, "the decision log must never contain the api key")
+  } finally {
+    await rm(logDir, { recursive: true, force: true })
+  }
+})

@@ -64,7 +64,10 @@ test("request: classifies a 4xx as a provider failure and never retries", async 
   const client = new SystemOneClient(config(), "v")
   const result = await client.request("state", QUESTIONS)
   assert.equal(result.ok, false)
-  if (!result.ok) assert.deepEqual(result.failure, { kind: "provider", status: 400 })
+  if (!result.ok) {
+    assert.equal(result.failure.kind, "provider")
+    if (result.failure.kind === "provider") assert.equal(result.failure.status, 400)
+  }
   assert.equal(calls, 1, "a deterministic 4xx must not be retried")
 })
 
@@ -233,4 +236,75 @@ test("request: a >4000-char state is truncated in the wire body and the cache ke
   assert.equal(bodies.length, 1, "the truncated state must be the cache key")
   assert.ok((bodies[0]?.state.length ?? 0) <= 4000, "wire body state must be bounded to <=4000 chars")
   assert.equal(bodies[0]?.state, "x".repeat(4000))
+})
+
+test("request: a provider failure carries the HTTP status and a bounded body snippet", async () => {
+  globalThis.fetch = (async () =>
+    new Response("upstream exploded: quota exceeded", { status: 502 })) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+  const result = await client.request("state", QUESTIONS)
+  assert.equal(result.ok, false)
+  if (!result.ok) {
+    assert.equal(result.failure.kind, "provider")
+    if (result.failure.kind === "provider") {
+      assert.equal(result.failure.status, 502)
+      assert.match(String(result.failure.detail), /HTTP 502/)
+      assert.match(String(result.failure.detail), /quota exceeded/)
+    }
+  }
+})
+
+test("request: the provider body snippet never leaks the API key and is bounded", async () => {
+  const secret = "sk-super-secret-key"
+  globalThis.fetch = (async () =>
+    new Response(`denied for ${secret} ${"z".repeat(1000)}`, { status: 401 })) as typeof fetch
+  const client = new SystemOneClient(config({ apiKey: secret }), "v")
+  const result = await client.request("state", QUESTIONS)
+  assert.equal(result.ok, false)
+  if (!result.ok) {
+    const detail = String(result.failure.detail)
+    assert.equal(detail.includes(secret), false, "the key must be redacted from the snippet")
+    assert.ok(detail.length <= 200 + "HTTP 401: ".length, "the snippet must be bounded")
+  }
+})
+
+test("request: trips a short-TTL circuit after a provider failure streak (bounded, fail-open)", async () => {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    return new Response("down", { status: 503 })
+  }) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+  // Each request with retry:false makes exactly one provider call.
+  for (let i = 0; i < 3; i++) {
+    await client.request(`state-${i}`, QUESTIONS, undefined, { retry: false })
+  }
+  const callsBeforeOpen = calls
+  // The next distinct request must fail open from the circuit, not the network.
+  const open = await client.request("state-after-open", QUESTIONS, undefined, { retry: false })
+  assert.equal(open.ok, false)
+  if (!open.ok) assert.equal(open.failure.kind, "circuit_open")
+  assert.equal(calls, callsBeforeOpen, "an open circuit must make no network call")
+})
+
+test("request: a success resets the failure streak", async () => {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    // Calls 1,2 fail; call 3 succeeds (resets); calls 4,5 fail again.
+    if (calls === 3) {
+      return new Response(JSON.stringify({ model: "m", answers: {}, usage: {} }), { status: 200 })
+    }
+    return new Response("down", { status: 503 })
+  }) as typeof fetch
+  const client = new SystemOneClient(config(), "v")
+  await client.request("s1", QUESTIONS, undefined, { retry: false })
+  await client.request("s2", QUESTIONS, undefined, { retry: false })
+  await client.request("s3", QUESTIONS, undefined, { retry: false }) // succeeds, resets
+  // Two more failures must not trip the circuit yet (streak restarted).
+  const a = await client.request("s4", QUESTIONS, undefined, { retry: false })
+  const b = await client.request("s5", QUESTIONS, undefined, { retry: false })
+  assert.equal(a.ok, false)
+  assert.equal(b.ok, false)
+  if (!b.ok) assert.notEqual(b.failure.kind, "circuit_open", "the streak must have reset on success")
 })
