@@ -139,6 +139,10 @@ The JEV key and the base URL are both required; if neither source supplies one, 
 | `decisionLogPath` | `JEV_DECISION_LOG` | `~/.config/opencode/jev-decisions.log` | Newline-delimited JSON decision log. An empty string or `off` disables logging. |
 | `decisionLogMaxBytes` | `JEV_DECISION_LOG_MAX_BYTES` | `1000000` | Rotate the decision log once it reaches this many bytes. |
 | `decisionLogBackups` | `JEV_DECISION_LOG_BACKUPS` | `3` | Number of rotated copies to keep (`<path>.1` .. `<path>.N`). |
+| `traceLog` | `JEV_TRACE_LOG` | `false` | Opt-in per-call trace log (one entry per Jev call). Off by default, so no trace file IO happens until enabled. |
+| `traceLogPath` | `JEV_TRACE_LOG_PATH` | `~/.local/share/opencode/log/jev.log` | Trace-log file path. An empty string or `off` disables writing. |
+| `traceLogMaxBytes` | `JEV_TRACE_LOG_MAX_BYTES` | `1000000` | Rotate the trace log once it reaches this many bytes. |
+| `traceLogBackups` | `JEV_TRACE_LOG_BACKUPS` | `3` | Number of rotated trace-log copies to keep. |
 | `toastDecisions` | `JEV_TOAST_DECISIONS` | `false` | Toast **every** decision (not just the three default toasts). |
 
 Thresholds are per category; there is no single global threshold across unrelated decisions. A value outside `[0, 1]` is ignored and the default is used, so a typo cannot widen a guardrail silently. A wrong-typed option is likewise ignored (the environment value then applies) and logs a one-time warning naming the field, never its value. The decision-log fields are validated the same way: `decisionLogMaxBytes` and `decisionLogBackups` must be non-negative integers, and `toastDecisions` must be a boolean. `timeoutMs` must be a positive integer; a non-positive or non-integer value is ignored and warned.
@@ -150,6 +154,16 @@ opencode's plugin hooks all return `Promise<void>` and **cannot inject an assist
 - **Decision log** — one JSON object per line: `ts`, `hook`, `kind` (`valid`/`abstain`/`invalid`/`unavailable`), `decision` (the chosen label, or `null`), `confidence` (or `null`), `action` (`block`/`allow`/`toast`/`log`/`context`/`return`/`none`), and an optional short `detail`. The log rotates on size: when it reaches `decisionLogMaxBytes`, `<path>` becomes `<path>.1`, older copies shift up, and anything beyond `decisionLogBackups` is dropped. The file is created (with parent directories) on first write; a write failure is warned once and never thrown into a hook. The API key, request body, and full state are never written, and `detail` is truncated to 200 characters.
 - **Startup proof** — when Jev is enabled, the plugin emits one `Jev enabled: model=…, baseUrl=<host>, key=<set|missing>` log line (host only, never the full URL or the key value). With `toastDecisions` on, the same line is also shown as a toast.
 - **Toast every decision** — with `toastDecisions: false` (default) the three default toasts still fire (confident `needs_human`, confident non-transient error severity, security-sensitive file edit); with `toastDecisions: true` every decision also surfaces a toast, including the ones that would otherwise only be logged.
+
+### Per-call trace log (opt-in)
+
+The decision log records the **outcome** of each decision; the trace log records the **raw call** that produced it, so a failure can be traced after the fact (for example, why a call returned `invalid:wrong-type` or `unavailable:provider`).
+
+- **Opt-in** — off by default. Enable it with the `traceLog: true` option or `JEV_TRACE_LOG=1`. While disabled the client performs **zero trace file IO**: no directory, no file, no write attempt.
+- **One entry per call** — each line is one JSON object: `ts`, `hook`, `summary` (a bounded, non-secret tool/state summary), `questionId`, `questionType`, `model`, `durationMs`, `cache` (`hit`/`miss`), `circuit` (`open`/`closed`), `outcome` (`valid`/`abstain`/`invalid`/`unavailable`/`timeout`/`transport`/`provider`/`busy`/`circuit_open`/`cache_hit`), and an optional bounded `snippet`.
+- **Bounded and redacted** — `summary` and `snippet` are truncated to 200 characters; the `snippet` is single-line and has the API key redacted before it is written. The API key, `Authorization` header, and full request/response bodies are never written.
+- **Rotation** — same size-based rotation as the decision log (`traceLogMaxBytes`, `traceLogBackups`), so it cannot grow without bound.
+- **Never throws** — a write failure is warned once and swallowed, so trace logging can never break a hook or the main loop.
 
 ### Security: prefer env or the key file for the secret
 
