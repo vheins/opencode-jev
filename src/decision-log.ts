@@ -78,7 +78,7 @@ function truncateDetail(detail: string): string {
 }
 
 /** Render an unknown thrown value as a short message, without a stack. */
-function reasonOf(error: unknown): string {
+export function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
@@ -92,7 +92,7 @@ function reasonOf(error: unknown): string {
  * @param path - The active log file.
  * @param backups - Number of rotated copies to keep.
  */
-async function rotate(path: string, backups: number): Promise<void> {
+export async function rotate(path: string, backups: number): Promise<void> {
   if (backups <= 0) {
     await unlink(path).catch(() => {})
     return

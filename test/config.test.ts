@@ -281,6 +281,70 @@ test("loadConfig: an empty decisionLogPath option disables logging (not ignored)
   assert.equal(warnings.length, 0, "an empty path is a valid 'disable' value, not a warning")
 })
 
+test("loadConfig: trace-log is OFF by default and points at the share dir", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.traceLog, false, "trace logging must be opt-in")
+  assert.match(config.traceLogPath, /\.local[/\\]share[/\\]opencode[/\\]log[/\\]jev\.log$/)
+  assert.equal(config.traceLogMaxBytes, 1_000_000)
+  assert.equal(config.traceLogBackups, 3)
+})
+
+test("loadConfig: trace-log env enables and overrides the path", () => {
+  const { config } = loadConfig(
+    {},
+    {
+      JEV_API_KEY: "k",
+      JEV_BASE_URL: "https://env.example/v1",
+      JEV_TRACE_LOG: "1",
+      JEV_TRACE_LOG_PATH: "/tmp/jev-trace.log",
+      JEV_TRACE_LOG_MAX_BYTES: "4096",
+      JEV_TRACE_LOG_BACKUPS: "2",
+    },
+    "k",
+  )
+  assert.equal(config.traceLog, true)
+  assert.equal(config.traceLogPath, "/tmp/jev-trace.log")
+  assert.equal(config.traceLogMaxBytes, 4096)
+  assert.equal(config.traceLogBackups, 2)
+})
+
+test("loadConfig: trace-log options override the env (options > env)", () => {
+  const { config } = loadConfig(
+    { traceLog: true, traceLogPath: "/tmp/jev-opt-trace.log", traceLogMaxBytes: 8192, traceLogBackups: 1 },
+    {
+      JEV_API_KEY: "k",
+      JEV_BASE_URL: "https://env.example/v1",
+      JEV_TRACE_LOG: "0",
+      JEV_TRACE_LOG_PATH: "/tmp/jev-env-trace.log",
+      JEV_TRACE_LOG_MAX_BYTES: "4096",
+      JEV_TRACE_LOG_BACKUPS: "2",
+    },
+    "k",
+  )
+  assert.equal(config.traceLog, true)
+  assert.equal(config.traceLogPath, "/tmp/jev-opt-trace.log")
+  assert.equal(config.traceLogMaxBytes, 8192)
+  assert.equal(config.traceLogBackups, 1)
+})
+
+test("loadConfig: wrong-typed trace-log options are ignored and warn", () => {
+  const { config, warnings } = loadConfig(
+    { traceLog: "yes", traceLogPath: 123, traceLogMaxBytes: -1, traceLogBackups: 1.5 },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.traceLog, false, "a non-boolean must not flip tracing on")
+  assert.match(config.traceLogPath, /jev\.log$/)
+  assert.equal(config.traceLogMaxBytes, 1_000_000)
+  assert.equal(config.traceLogBackups, 3)
+  const fields = warnings.map((warning) => warning.field).sort()
+  assert.deepEqual(fields, ["traceLog", "traceLogBackups", "traceLogMaxBytes", "traceLogPath"])
+})
+
 test("loadConfig: wrong-typed decision-log options are ignored and warn", () => {
   const { config, warnings } = loadConfig(
     { decisionLogMaxBytes: "big", decisionLogBackups: -1, toastDecisions: "yes" },

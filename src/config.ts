@@ -20,6 +20,31 @@ import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
+import {
+  booleanOption,
+  countOption,
+  parseBoolean,
+  parseCount,
+  parsePositiveInt,
+  parseThreshold,
+  positiveIntOption,
+  stringOption,
+  thresholdOption,
+  type ConfigWarning,
+  type PluginOptions,
+} from "./config-options.ts"
+
+// Re-export the parsing helpers so existing callers keep importing them from
+// this module; the implementations now live in `config-options.ts`.
+export {
+  parseBoolean,
+  parseCount,
+  parsePositiveInt,
+  parseThreshold,
+  type ConfigWarning,
+  type PluginOptions,
+} from "./config-options.ts"
+
 /** Fallback key file written by the router provider setup. */
 export const DEFAULT_KEY_FILE = join(homedir(), ".config", "opencode", ".jev-key")
 
@@ -57,6 +82,23 @@ export const DEFAULT_DECISION_LOG_BACKUPS = 3
 
 /** Default for whether every decision also surfaces a toast. */
 export const DEFAULT_TOAST_DECISIONS = false
+
+/** Default trace-log path; empty string or `"off"` disables tracing. */
+export const DEFAULT_TRACE_LOG_PATH = join(homedir(), ".local", "share", "opencode", "log", "jev.log")
+
+/** Default trace-log size cap (bytes) before rotation. */
+export const DEFAULT_TRACE_LOG_MAX_BYTES = 1_000_000
+
+/** Default number of rotated trace-log copies to keep. */
+export const DEFAULT_TRACE_LOG_BACKUPS = 3
+
+/**
+ * Default for whether the opt-in per-call trace log is enabled.
+ *
+ * OFF by default: enabling it writes one line per Jev call, so the default
+ * install performs no trace file IO at all.
+ */
+export const DEFAULT_TRACE_LOG = false
 
 /**
  * Default per-request timeout (ms) for a Jev call.
@@ -99,6 +141,14 @@ export type Config = {
   readonly decisionLogMaxBytes: number
   /** Number of rotated decision-log copies to keep. */
   readonly decisionLogBackups: number
+  /** Whether the opt-in per-call trace log is enabled. */
+  readonly traceLog: boolean
+  /** Trace-log file path; empty or `"off"` disables tracing. */
+  readonly traceLogPath: string
+  /** Rotate the trace log once it reaches this many bytes. */
+  readonly traceLogMaxBytes: number
+  /** Number of rotated trace-log copies to keep. */
+  readonly traceLogBackups: number
   /** Whether every decision also surfaces a TUI toast. */
   readonly toastDecisions: boolean
   /** Per-request timeout (ms). */
@@ -111,219 +161,6 @@ export type Config = {
 
 /** The reason Jev is disabled, when it is. */
 export type DisabledReason = "missing-key" | "missing-base-url"
-
-/**
- * Parse a numeric threshold from an environment value.
- *
- * A value outside `[0, 1]` is treated as absent so a typo cannot widen a
- * guardrail silently.
- *
- * @param raw - Raw environment string, or `undefined` when unset.
- * @param fallback - Value returned when the input is missing or not finite.
- * @returns The parsed threshold, or `fallback`.
- */
-export function parseThreshold(raw: string | undefined, fallback: number): number {
-  if (raw === undefined || raw.trim() === "") return fallback
-  const parsed = Number(raw)
-  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) return fallback
-  return parsed
-}
-
-/**
- * Parse a non-negative integer from an environment value.
- *
- * @param raw - Raw environment string, or `undefined` when unset.
- * @param fallback - Value returned when the input is missing or invalid.
- * @returns The parsed integer, or `fallback`.
- */
-export function parseCount(raw: string | undefined, fallback: number): number {
-  if (raw === undefined || raw.trim() === "") return fallback
-  const parsed = Number(raw)
-  if (!Number.isInteger(parsed) || parsed < 0) return fallback
-  return parsed
-}
-
-/**
- * Parse a boolean from an environment value.
- *
- * Accepts `1`/`true`/`yes`/`on` (case-insensitive) as true and
- * `0`/`false`/`no`/`off` as false; anything else falls back.
- *
- * @param raw - Raw environment string, or `undefined` when unset.
- * @param fallback - Value returned when the input is missing or unrecognized.
- * @returns The parsed boolean, or `fallback`.
- */
-export function parseBoolean(raw: string | undefined, fallback: boolean): boolean {
-  if (raw === undefined) return fallback
-  const value = raw.trim().toLowerCase()
-  if (value === "") return fallback
-  if (["1", "true", "yes", "on"].includes(value)) return true
-  if (["0", "false", "no", "off"].includes(value)) return false
-  return fallback
-}
-
-/** Untrusted plugin options delivered by the opencode.json tuple form. */
-export type PluginOptions = Record<string, unknown>
-
-/** A single ignored-option warning; it names the field, never its value. */
-export type ConfigWarning = { readonly field: string; readonly reason: string }
-
-/**
- * Read a string plugin option.
- *
- * A wrong-typed or blank value is ignored (the environment value then wins)
- * and reported as a warning. The value itself is never echoed, so an
- * option-supplied secret cannot leak through a warning.
- *
- * @param options - The raw plugin options.
- * @param field - The option key to read.
- * @param warnings - Collector for ignored-option warnings.
- * @returns The trimmed value, or `undefined` when absent or invalid.
- */
-function stringOption(
-  options: PluginOptions,
-  field: string,
-  warnings: ConfigWarning[],
-): string | undefined {
-  if (!(field in options)) return undefined
-  const raw = options[field]
-  if (typeof raw !== "string") {
-    warnings.push({ field, reason: "expected a string" })
-    return undefined
-  }
-  const trimmed = raw.trim()
-  if (trimmed === "") {
-    warnings.push({ field, reason: "empty string" })
-    return undefined
-  }
-  return trimmed
-}
-
-/**
- * Read a numeric threshold plugin option.
- *
- * A non-finite or out-of-range value is ignored and reported, so a typo cannot
- * widen a guardrail silently.
- *
- * @param options - The raw plugin options.
- * @param field - The option key to read.
- * @param fallback - Value used when the option is absent or invalid.
- * @param warnings - Collector for ignored-option warnings.
- * @returns The validated threshold, or `fallback`.
- */
-function thresholdOption(
-  options: PluginOptions,
-  field: string,
-  fallback: number,
-  warnings: ConfigWarning[],
-): number {
-  if (!(field in options)) return fallback
-  const raw = options[field]
-  if (typeof raw !== "number") {
-    warnings.push({ field, reason: "expected a number" })
-    return fallback
-  }
-  if (!Number.isFinite(raw) || raw < 0 || raw > 1) {
-    warnings.push({ field, reason: "expected a number in [0, 1]" })
-    return fallback
-  }
-  return raw
-}
-
-/**
- * Read a non-negative integer plugin option.
- *
- * A non-integer or negative value is ignored and reported, so a malformed
- * rotation setting cannot disable the cap silently.
- *
- * @param options - The raw plugin options.
- * @param field - The option key to read.
- * @param fallback - Value used when the option is absent or invalid.
- * @param warnings - Collector for ignored-option warnings.
- * @returns The validated integer, or `fallback`.
- */
-function countOption(
-  options: PluginOptions,
-  field: string,
-  fallback: number,
-  warnings: ConfigWarning[],
-): number {
-  if (!(field in options)) return fallback
-  const raw = options[field]
-  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
-    warnings.push({ field, reason: "expected a non-negative integer" })
-    return fallback
-  }
-  return raw
-}
-
-/**
- * Read a boolean plugin option.
- *
- * A non-boolean value is ignored and reported, so a string like `"false"`
- * cannot silently flip a flag on.
- *
- * @param options - The raw plugin options.
- * @param field - The option key to read.
- * @param fallback - Value used when the option is absent or invalid.
- * @param warnings - Collector for ignored-option warnings.
- * @returns The validated boolean, or `fallback`.
- */
-function booleanOption(
-  options: PluginOptions,
-  field: string,
-  fallback: boolean,
-  warnings: ConfigWarning[],
-): boolean {
-  if (!(field in options)) return fallback
-  const raw = options[field]
-  if (typeof raw !== "boolean") {
-    warnings.push({ field, reason: "expected a boolean" })
-    return fallback
-  }
-  return raw
-}
-
-/**
- * Parse a positive integer from an environment value.
- *
- * @param raw - Raw environment string, or `undefined` when unset.
- * @param fallback - Value returned when the input is missing or invalid.
- * @returns The parsed integer, or `fallback`.
- */
-export function parsePositiveInt(raw: string | undefined, fallback: number): number {
-  if (raw === undefined || raw.trim() === "") return fallback
-  const parsed = Number(raw)
-  if (!Number.isInteger(parsed) || parsed <= 0) return fallback
-  return parsed
-}
-
-/**
- * Read a positive-integer plugin option.
- *
- * A non-integer or non-positive value is ignored and reported, so a malformed
- * timeout cannot disable the bound silently.
- *
- * @param options - The raw plugin options.
- * @param field - The option key to read.
- * @param fallback - Value used when the option is absent or invalid.
- * @param warnings - Collector for ignored-option warnings.
- * @returns The validated integer, or `fallback`.
- */
-function positiveIntOption(
-  options: PluginOptions,
-  field: string,
-  fallback: number,
-  warnings: ConfigWarning[],
-): number {
-  if (!(field in options)) return fallback
-  const raw = options[field]
-  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
-    warnings.push({ field, reason: "expected a positive integer" })
-    return fallback
-  }
-  return raw
-}
 
 /**
  * Read the JEV API key from the provider key file only.
@@ -397,10 +234,24 @@ export function loadConfig(
     decisionLogPath = env.JEV_DECISION_LOG?.trim() || DEFAULT_DECISION_LOG_PATH
   }
 
+  // A blank `traceLogPath` option is meaningful: it disables tracing. Read it
+  // directly rather than through `stringOption`, which rejects blanks.
+  let traceLogPath: string
+  if ("traceLogPath" in options) {
+    const raw = options.traceLogPath
+    if (typeof raw === "string") {
+      traceLogPath = raw.trim()
+    } else {
+      warnings.push({ field: "traceLogPath", reason: "expected a string" })
+      traceLogPath = env.JEV_TRACE_LOG_PATH?.trim() || DEFAULT_TRACE_LOG_PATH
+    }
+  } else {
+    traceLogPath = env.JEV_TRACE_LOG_PATH?.trim() || DEFAULT_TRACE_LOG_PATH
+  }
+
   let disabledReason: DisabledReason | undefined
   if (!apiKey) disabledReason = "missing-key"
   else if (!baseUrl) disabledReason = "missing-base-url"
-
   return {
     config: {
       enabled: disabledReason === undefined,
@@ -448,6 +299,25 @@ export function loadConfig(
         options,
         "decisionLogBackups",
         parseCount(env.JEV_DECISION_LOG_BACKUPS, DEFAULT_DECISION_LOG_BACKUPS),
+        warnings,
+      ),
+      traceLog: booleanOption(
+        options,
+        "traceLog",
+        parseBoolean(env.JEV_TRACE_LOG, DEFAULT_TRACE_LOG),
+        warnings,
+      ),
+      traceLogPath,
+      traceLogMaxBytes: countOption(
+        options,
+        "traceLogMaxBytes",
+        parseCount(env.JEV_TRACE_LOG_MAX_BYTES, DEFAULT_TRACE_LOG_MAX_BYTES),
+        warnings,
+      ),
+      traceLogBackups: countOption(
+        options,
+        "traceLogBackups",
+        parseCount(env.JEV_TRACE_LOG_BACKUPS, DEFAULT_TRACE_LOG_BACKUPS),
         warnings,
       ),
       toastDecisions: booleanOption(

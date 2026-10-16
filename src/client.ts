@@ -13,6 +13,7 @@
 import type { Question } from "@typesafe-ai/sdk"
 
 import type { Config } from "./config.ts"
+import { appendTrace, type TraceLogOptions, type TraceOutcome } from "./trace-log.ts"
 
 /**
  * How a Jev call failed, mapped to a failure policy.
@@ -45,6 +46,12 @@ export type CallOptions = {
   readonly timeoutMs?: number
   /** Whether a transient failure may be retried once; defaults to true. */
   readonly retry?: boolean
+  /**
+   * Trace context for this call: the hook that made it and a bounded,
+   * non-secret summary of the state under judgment. Only used when the trace
+   * log is enabled; never written otherwise.
+   */
+  readonly trace?: { readonly hook: string; readonly summary: string }
 }
 
 /** Maximum characters in a state string sent to the router. */
@@ -161,6 +168,7 @@ export class SystemOneClient {
   private readonly config: Config
   private readonly policyVersion: string
   private readonly semaphore: Semaphore
+  private readonly trace: TraceLogOptions
   private readonly cache = new Map<string, { readonly at: number; readonly body: unknown }>()
   private consecutiveFailures = 0
   private circuitOpenUntil = 0
@@ -170,11 +178,14 @@ export class SystemOneClient {
    * @param config - Resolved configuration (base URL, key, model, bounds).
    * @param policyVersion - A version string that changes when decision logic
    * changes, so a cached decision cannot outlive the policy that produced it.
+   * @param trace - Optional opt-in trace-log options; when omitted, tracing is
+   * disabled and no call performs any trace file IO.
    */
-  constructor(config: Config, policyVersion: string) {
+  constructor(config: Config, policyVersion: string, trace?: TraceLogOptions) {
     this.config = config
     this.policyVersion = policyVersion
     this.semaphore = new Semaphore(config.maxConcurrent)
+    this.trace = trace ?? { enabled: false, path: "", maxBytes: 0, backups: 0 }
   }
 
   /** The configured base URL, when present. */
@@ -207,9 +218,13 @@ export class SystemOneClient {
     modelOverride?: string,
     options?: CallOptions,
   ): Promise<CallResult> {
+    const startedAt = Date.now()
     const baseUrl = this.baseUrl
     const apiKey = this.apiKey
-    if (!baseUrl || !apiKey) return { ok: false, failure: { kind: "busy" } }
+    if (!baseUrl || !apiKey) {
+      await this.emitTrace(options, this.config.model, questions, startedAt, "miss", "closed", "busy")
+      return { ok: false, failure: { kind: "busy" } }
+    }
 
     const timeoutMs = options?.timeoutMs ?? this.config.timeoutMs
     const retry = options?.retry ?? true
@@ -219,6 +234,7 @@ export class SystemOneClient {
 
     const cached = this.cache.get(key)
     if (cached && Date.now() - cached.at < this.config.cacheTtlMs) {
+      await this.emitTrace(options, model, questions, startedAt, "hit", "closed", "cache_hit")
       return { ok: true, body: cached.body }
     }
 
@@ -231,10 +247,21 @@ export class SystemOneClient {
         this.lastFailureDetail === undefined
           ? "circuit open after repeated provider failures"
           : `circuit open after repeated provider failures; last: ${this.lastFailureDetail}`
+      await this.emitTrace(
+        options,
+        model,
+        questions,
+        startedAt,
+        "miss",
+        "open",
+        "circuit_open",
+        detail,
+      )
       return { ok: false, failure: { kind: "circuit_open", detail } }
     }
 
     if (!this.semaphore.tryAcquire()) {
+      await this.emitTrace(options, model, questions, startedAt, "miss", "closed", "busy")
       return { ok: false, failure: { kind: "busy" } }
     }
     try {
@@ -242,10 +269,21 @@ export class SystemOneClient {
       if (first.ok) {
         this.recordSuccess()
         this.remember(key, first.body)
+        await this.emitTrace(
+          options,
+          model,
+          questions,
+          startedAt,
+          "miss",
+          "closed",
+          "valid",
+          bodySnippet(safeStringify(first.body), apiKey),
+        )
         return first
       }
       if (!retry || !isTransient(first.failure)) {
         this.recordFailure(first.failure)
+        await this.emitFailureTrace(options, model, questions, startedAt, first.failure)
         return first
       }
       await delay(RETRY_BACKOFF_MS)
@@ -253,13 +291,89 @@ export class SystemOneClient {
       if (second.ok) {
         this.recordSuccess()
         this.remember(key, second.body)
+        await this.emitTrace(
+          options,
+          model,
+          questions,
+          startedAt,
+          "miss",
+          "closed",
+          "valid",
+          bodySnippet(safeStringify(second.body), apiKey),
+        )
       } else {
         this.recordFailure(second.failure)
+        await this.emitFailureTrace(options, model, questions, startedAt, second.failure)
       }
       return second
     } finally {
       this.semaphore.release()
     }
+  }
+
+  /**
+   * Append one trace entry for a call, when tracing is enabled.
+   *
+   * Building the entry is skipped entirely when tracing is off, so the default
+   * install performs no trace work at all.
+   *
+   * @param options - The call options carrying optional trace context.
+   * @param model - The model used for the call.
+   * @param questions - The questions sent, used to derive the id and type.
+   * @param startedAt - Epoch ms when the call began.
+   * @param cache - Whether the result was a cache hit or miss.
+   * @param circuit - Whether the circuit was open at call time.
+   * @param outcome - The outcome class.
+   * @param snippet - Optional bounded, redacted response/error snippet.
+   */
+  private async emitTrace(
+    options: CallOptions | undefined,
+    model: string,
+    questions: Record<string, Question>,
+    startedAt: number,
+    cache: "hit" | "miss",
+    circuit: "open" | "closed",
+    outcome: TraceOutcome,
+    snippet?: string,
+  ): Promise<void> {
+    if (!this.trace.enabled) return
+    const first = Object.keys(questions)[0]
+    const question = first !== undefined ? questions[first] : undefined
+    await appendTrace(
+      {
+        hook: options?.trace?.hook ?? "unknown",
+        summary: options?.trace?.summary ?? "",
+        questionId: first ?? "",
+        questionType: question?.type ?? "unknown",
+        model,
+        durationMs: Date.now() - startedAt,
+        cache,
+        circuit,
+        outcome,
+        ...(snippet !== undefined ? { snippet } : {}),
+      },
+      this.trace,
+    )
+  }
+
+  /** Append a trace entry for a classified failure, deriving its outcome. */
+  private async emitFailureTrace(
+    options: CallOptions | undefined,
+    model: string,
+    questions: Record<string, Question>,
+    startedAt: number,
+    failure: CallFailure,
+  ): Promise<void> {
+    await this.emitTrace(
+      options,
+      model,
+      questions,
+      startedAt,
+      "miss",
+      "closed",
+      failure.kind,
+      failure.detail,
+    )
   }
 
   /** Reset the failure streak after a successful call. */

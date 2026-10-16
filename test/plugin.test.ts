@@ -13,7 +13,7 @@
  */
 
 import assert from "node:assert/strict"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, beforeEach, test } from "node:test"
@@ -128,6 +128,9 @@ beforeEach(() => {
   // ~/.config/opencode/jev-decisions.log on the host.
   process.env.JEV_DECISION_LOG = "off"
   delete process.env.JEV_TOAST_DECISIONS
+  // Tracing is opt-in and off by default; keep it off unless a test enables it.
+  delete process.env.JEV_TRACE_LOG
+  delete process.env.JEV_TRACE_LOG_PATH
 })
 
 afterEach(() => {
@@ -842,5 +845,66 @@ test("plugin: a provider failure is logged with its HTTP status and no secret", 
     assert.equal(raw.includes(secret), false, "the decision log must never contain the api key")
   } finally {
     await rm(logDir, { recursive: true, force: true })
+  }
+})
+
+test("plugin: traceLog OFF (default) writes no trace file for a hook call", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "jev-plugin-trace-off-"))
+  try {
+    process.env = {
+      ...originalEnv,
+      JEV_API_KEY: "test-key",
+      JEV_BASE_URL: "https://router.example/v1/systemone",
+      JEV_DECISION_LOG: "off",
+      JEV_TRACE_LOG_PATH: join(dir, "trace.log"),
+    }
+    delete process.env.JEV_TRACE_LOG
+    const { input } = stubInput()
+    routeFetch(() => new Response(choiceBody("risk", "mutating", 0.9), { status: 200 }))
+    const hooks = await plugin(input)
+    const before = hooks["tool.execute.before"]
+    assert.ok(before)
+    await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo hi > x.txt" } })
+    assert.deepEqual(await readdir(dir), [], "trace logging is off by default and must write nothing")
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("plugin: traceLog ON writes one entry per JEV call with hook, model, and outcome", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "jev-plugin-trace-on-"))
+  try {
+    const tracePath = join(dir, "trace.log")
+    process.env = {
+      ...originalEnv,
+      JEV_API_KEY: "test-key",
+      JEV_BASE_URL: "https://router.example/v1/systemone",
+      JEV_DECISION_LOG: "off",
+      JEV_TRACE_LOG: "1",
+      JEV_TRACE_LOG_PATH: tracePath,
+    }
+    const { input } = stubInput()
+    routeFetch(() => new Response(choiceBody("risk", "mutating", 0.9), { status: 200 }))
+    const hooks = await plugin(input)
+    const before = hooks["tool.execute.before"]
+    assert.ok(before)
+    await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo hi > x.txt" } })
+    const raw = await readFile(tracePath, "utf8")
+    const lines = raw
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+    assert.equal(lines.length, 1, "one JEV call must produce exactly one trace entry")
+    assert.equal(lines[0]?.hook, "tool.execute.before")
+    assert.equal(lines[0]?.summary, "bash")
+    assert.equal(lines[0]?.questionId, "risk")
+    assert.equal(lines[0]?.questionType, "choice")
+    assert.equal(lines[0]?.model, "oc/jev-1.13-free")
+    assert.equal(lines[0]?.cache, "miss")
+    assert.equal(lines[0]?.circuit, "closed")
+    assert.equal(lines[0]?.outcome, "valid")
+    assert.equal(typeof lines[0]?.durationMs, "number")
+  } finally {
+    await rm(dir, { recursive: true, force: true })
   }
 })

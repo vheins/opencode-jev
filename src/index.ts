@@ -61,6 +61,7 @@ import {
   failurePolicy,
   type ActionCategory,
 } from "./policy.ts"
+import type { TraceLogOptions } from "./trace-log.ts"
 import { parseResponse } from "./validate.ts"
 
 /** Log service name stamped on every entry this plugin emits. */
@@ -242,7 +243,27 @@ export default (async (input, options?: PluginOptions) => {
 
   const { config, disabledReason, warnings } = loadConfig(options ?? {})
   const warnOnce = new WarnOnce()
-  const systemOne = new SystemOneClient(config, POLICY_VERSION)
+
+  /**
+   * Append a trace-log write failure at most once.
+   *
+   * @param reason - A short filesystem error message (never a secret).
+   */
+  const onTraceError = (reason: string): void => {
+    if (warnOnce.claim(`trace-log:${reason}`)) {
+      void log("warn", "Jev trace log write failed", { reason })
+    }
+  }
+
+  const traceLog: TraceLogOptions = {
+    enabled: config.traceLog,
+    path: config.traceLogPath,
+    maxBytes: config.traceLogMaxBytes,
+    backups: config.traceLogBackups,
+    onError: onTraceError,
+  }
+
+  const systemOne = new SystemOneClient(config, POLICY_VERSION, traceLog)
 
   /**
    * Append a decision to the JSON log, reporting a write failure at most once.
@@ -391,7 +412,9 @@ export default (async (input, options?: PluginOptions) => {
       })()
       if (!questions) return `type=${args.type} requires at least two criteria entries.`
 
-      const result = await systemOne.request(args.state, questions, args.model)
+      const result = await systemOne.request(args.state, questions, args.model, {
+        trace: { hook: "tool.jev_decide", summary: args.type },
+      })
       if (!result.ok) {
         await log("error", "jev_decide failed", { type: args.type, failure: result.failure.kind })
         await record("tool.jev_decide", { kind: "unavailable", decision: null, confidence: null }, "return", args.type)
@@ -431,7 +454,7 @@ export default (async (input, options?: PluginOptions) => {
           },
           // Blocking hook: no retry, so worst-case blocking latency is one
           // timeout (~3s), not two. Fail-open on timeout is preserved.
-          { retry: false },
+          { retry: false, trace: { hook: "tool.execute.before", summary: hookInput.tool } },
         )
         if (decision.kind === "valid") {
           await log("info", "Jev tool risk verdict", {
@@ -517,6 +540,7 @@ export default (async (input, options?: PluginOptions) => {
           COMPACT_QUESTION_ID,
           COMPACT_INSTRUCTIONS,
           { context: output.context },
+          { trace: { hook: "experimental.session.compacting", summary: COMPACT_QUESTION_ID } },
         )
         if (decision.kind !== "valid") {
           await record("experimental.session.compacting", summarizeNoul(decision), "log")
@@ -544,10 +568,14 @@ export default (async (input, options?: PluginOptions) => {
           case "session.error": {
             const error = event.properties.error
             if (!error || error.name === "MessageAbortedError") return
-            const severity = await classifySeverity(systemOne, {
-              error,
-              sessionID: event.properties.sessionID,
-            })
+            const severity = await classifySeverity(
+              systemOne,
+              {
+                error,
+                sessionID: event.properties.sessionID,
+              },
+              { trace: { hook: "event:session.error", summary: error.name ?? "error" } },
+            )
             if (severity.kind !== "valid") {
               await record("event:session.error", summarizeChoice(severity), "log")
               return

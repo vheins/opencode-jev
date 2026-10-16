@@ -11,10 +11,14 @@
  */
 
 import assert from "node:assert/strict"
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { afterEach, test } from "node:test"
 
 import { SystemOneClient } from "../src/client.ts"
 import type { Config } from "../src/config.ts"
+import type { TraceLogOptions } from "../src/trace-log.ts"
 
 const originalFetch = globalThis.fetch
 
@@ -33,6 +37,10 @@ function config(overrides: Partial<Config> = {}): Config {
     decisionLogPath: "off",
     decisionLogMaxBytes: 1_000_000,
     decisionLogBackups: 3,
+    traceLog: false,
+    traceLogPath: "off",
+    traceLogMaxBytes: 1_000_000,
+    traceLogBackups: 3,
     toastDecisions: false,
     timeoutMs: 50,
     cacheTtlMs: 60_000,
@@ -307,4 +315,122 @@ test("request: a success resets the failure streak", async () => {
   assert.equal(a.ok, false)
   assert.equal(b.ok, false)
   if (!b.ok) assert.notEqual(b.failure.kind, "circuit_open", "the streak must have reset on success")
+})
+
+/** A per-test temp dir for trace-log assertions. */
+async function traceDir(): Promise<string> {
+  return mkdtemp(join(tmpdir(), "jev-client-trace-"))
+}
+
+/** Read every trace line as parsed JSON objects. */
+async function traceLines(path: string): Promise<Array<Record<string, unknown>>> {
+  const raw = await readFile(path, "utf8")
+  return raw
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+}
+
+test("request: with tracing OFF no trace file is created", async () => {
+  const dir = await traceDir()
+  try {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ model: "m", answers: {}, usage: {} }), { status: 200 })) as typeof fetch
+    const trace: TraceLogOptions = {
+      enabled: false,
+      path: join(dir, "trace.log"),
+      maxBytes: 1_000_000,
+      backups: 3,
+    }
+    const client = new SystemOneClient(config(), "v", trace)
+    await client.request("state", QUESTIONS, undefined, { trace: { hook: "h", summary: "s" } })
+    assert.deepEqual(await readdir(dir), [], "a disabled trace must write no file")
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("request: with tracing ON records one entry per call with hook, cache, circuit, outcome", async () => {
+  const dir = await traceDir()
+  try {
+    const path = join(dir, "trace.log")
+    let calls = 0
+    globalThis.fetch = (async () => {
+      calls += 1
+      return new Response(JSON.stringify({ model: "m", answers: {}, usage: {} }), { status: 200 })
+    }) as typeof fetch
+    const trace: TraceLogOptions = { enabled: true, path, maxBytes: 1_000_000, backups: 3 }
+    const client = new SystemOneClient(config(), "v", trace)
+    await client.request("state", QUESTIONS, undefined, {
+      trace: { hook: "tool.execute.before", summary: "bash" },
+    })
+    // Same input again: served from cache.
+    await client.request("state", QUESTIONS, undefined, {
+      trace: { hook: "tool.execute.before", summary: "bash" },
+    })
+    const lines = await traceLines(path)
+    assert.equal(lines.length, 2)
+    assert.equal(lines[0]?.hook, "tool.execute.before")
+    assert.equal(lines[0]?.summary, "bash")
+    assert.equal(lines[0]?.questionId, "risk")
+    assert.equal(lines[0]?.cache, "miss")
+    assert.equal(lines[0]?.circuit, "closed")
+    assert.equal(lines[0]?.outcome, "valid")
+    assert.equal(typeof lines[0]?.durationMs, "number")
+    assert.equal(lines[1]?.cache, "hit")
+    assert.equal(lines[1]?.outcome, "cache_hit")
+    assert.equal(calls, 1, "the second call must be served from cache")
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("request: a traced provider failure records the outcome and a redacted snippet", async () => {
+  const dir = await traceDir()
+  try {
+    const path = join(dir, "trace.log")
+    const secret = "sk-trace-secret-key"
+    globalThis.fetch = (async () =>
+      new Response(`denied for ${secret}`, { status: 401 })) as typeof fetch
+    const trace: TraceLogOptions = { enabled: true, path, maxBytes: 1_000_000, backups: 3 }
+    const client = new SystemOneClient(config({ apiKey: secret }), "v", trace)
+    await client.request("state", QUESTIONS, undefined, {
+      retry: false,
+      trace: { hook: "tool.execute.before", summary: "bash" },
+    })
+    const raw = await readFile(path, "utf8")
+    const lines = await traceLines(path)
+    assert.equal(lines.length, 1)
+    assert.equal(lines[0]?.outcome, "provider")
+    assert.match(String(lines[0]?.snippet), /HTTP 401/)
+    assert.equal(raw.includes(secret), false, "the trace log must never contain the api key")
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("request: a traced circuit-open call records the circuit state without a network call", async () => {
+  const dir = await traceDir()
+  try {
+    const path = join(dir, "trace.log")
+    let calls = 0
+    globalThis.fetch = (async () => {
+      calls += 1
+      return new Response("down", { status: 503 })
+    }) as typeof fetch
+    const trace: TraceLogOptions = { enabled: true, path, maxBytes: 1_000_000, backups: 3 }
+    const client = new SystemOneClient(config(), "v", trace)
+    for (let i = 0; i < 3; i++) {
+      await client.request(`state-${i}`, QUESTIONS, undefined, { retry: false })
+    }
+    const callsBeforeOpen = calls
+    await client.request("state-after-open", QUESTIONS, undefined, { retry: false })
+    const lines = await traceLines(path)
+    const last = lines[lines.length - 1]
+    assert.equal(last?.outcome, "circuit_open")
+    assert.equal(last?.circuit, "open")
+    assert.equal(calls, callsBeforeOpen, "an open circuit must make no network call")
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
