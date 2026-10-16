@@ -19,6 +19,7 @@ import {
   type ChoiceVerdict,
   type Decision,
   type InvalidReason,
+  type ScoreVerdict,
   type UnavailableReason,
 } from "./domain.ts"
 
@@ -38,6 +39,12 @@ function isUnitInterval(value: unknown): value is number {
 function isProbabilityMap(value: unknown): value is Record<string, number> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false
   return Object.values(value).every(isUnitInterval)
+}
+
+/** A rubric legend: descriptions keyed by score, each a string or `null`. */
+function isLegend(value: unknown): value is Record<string, string | null> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false
+  return Object.values(value).every((entry) => entry === null || typeof entry === "string")
 }
 
 /**
@@ -157,6 +164,63 @@ export function validateNoul(
   if (record.type !== "noul") return { ok: false, reason: "wrong-type" }
   if (!isUnitInterval(record.noul)) return { ok: false, reason: "confidence-out-of-range" }
   return { ok: true, probability: record.noul }
+}
+
+/**
+ * Validate a raw score answer against an ordered rubric.
+ *
+ * A valid answer has `type === "score"`, a finite `score` within the rubric
+ * range `[0, rubricLength - 1]` (the SDK's expected score may fall between
+ * integer levels, so it is not required to be integral), a finite `confidence`
+ * in `[0, 1]` when present, and optional `legend`/`probabilities` that, when
+ * present, must be unit-interval probability maps.
+ *
+ * @param answer - The raw answer read from the response envelope.
+ * @param rubricLength - Number of rubric levels; valid scores span `0..length-1`.
+ * @returns The validated score verdict, or a rejected decision reason.
+ */
+export function validateScore(
+  answer: unknown,
+  rubricLength: number,
+):
+  | { readonly ok: true; readonly verdict: ScoreVerdict }
+  | { readonly ok: false; readonly reason: InvalidReason } {
+  if (answer === undefined || answer === null) {
+    return { ok: false, reason: "missing-answer" }
+  }
+  if (typeof answer !== "object" || Array.isArray(answer)) {
+    return { ok: false, reason: "wrong-type" }
+  }
+  const record = answer as Record<string, unknown>
+  if (record.type !== "score") return { ok: false, reason: "wrong-type" }
+  const max = rubricLength - 1
+  if (
+    typeof record.score !== "number" ||
+    !Number.isFinite(record.score) ||
+    record.score < 0 ||
+    record.score > max
+  ) {
+    return { ok: false, reason: "score-out-of-range" }
+  }
+  if (record.confidence !== undefined && !isUnitInterval(record.confidence)) {
+    return { ok: false, reason: "confidence-out-of-range" }
+  }
+  if (record.legend !== undefined && !isLegend(record.legend)) {
+    return { ok: false, reason: "confidence-out-of-range" }
+  }
+  if (record.probabilities !== undefined && !isProbabilityMap(record.probabilities)) {
+    return { ok: false, reason: "confidence-out-of-range" }
+  }
+  const confidence = isUnitInterval(record.confidence) ? record.confidence : 0
+  const legend = isLegend(record.legend) ? record.legend : undefined
+  const probabilities = isProbabilityMap(record.probabilities) ? record.probabilities : undefined
+  const verdict: ScoreVerdict = {
+    score: record.score,
+    confidence,
+    ...(legend === undefined ? {} : { legend }),
+    ...(probabilities === undefined ? {} : { probabilities }),
+  }
+  return { ok: true, verdict }
 }
 
 /**

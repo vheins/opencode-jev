@@ -17,6 +17,7 @@ import {
   parseResponse,
   validateChoice,
   validateNoul,
+  validateScore,
 } from "../src/validate.ts"
 import { MIN_ACTIONABLE_CONFIDENCE } from "../src/domain.ts"
 
@@ -110,6 +111,86 @@ test("validateNoul: rejects missing, wrong type, and out-of-range", () => {
   assert.deepEqual(validateNoul({ type: "choice" }), { ok: false, reason: "wrong-type" })
   assert.deepEqual(validateNoul({ type: "noul", noul: 1.5 }), { ok: false, reason: "confidence-out-of-range" })
   assert.deepEqual(validateNoul({ type: "noul", noul: Number.NaN }), { ok: false, reason: "confidence-out-of-range" })
+})
+
+test("validateScore: accepts an in-range score with confidence", () => {
+  const result = validateScore({ type: "score", score: 2, confidence: 0.8 }, 4)
+  assert.equal(result.ok, true)
+  if (result.ok) {
+    assert.equal(result.verdict.score, 2)
+    assert.equal(result.verdict.confidence, 0.8)
+  }
+})
+
+test("validateScore: accepts a fractional in-range score (SDK allows non-integer)", () => {
+  const result = validateScore({ type: "score", score: 1.5, confidence: 0.6 }, 4)
+  assert.equal(result.ok, true)
+  if (result.ok) assert.equal(result.verdict.score, 1.5)
+})
+
+test("validateScore: accepts the rubric boundaries 0 and rubricLength-1", () => {
+  const low = validateScore({ type: "score", score: 0 }, 3)
+  const high = validateScore({ type: "score", score: 2 }, 3)
+  assert.equal(low.ok, true)
+  assert.equal(high.ok, true)
+  if (low.ok) assert.equal(low.verdict.confidence, 0)
+})
+
+test("validateScore: rejects a missing or wrong-typed answer", () => {
+  assert.deepEqual(validateScore(undefined, 4), { ok: false, reason: "missing-answer" })
+  assert.deepEqual(validateScore(null, 4), { ok: false, reason: "missing-answer" })
+  assert.deepEqual(validateScore({ type: "noul", noul: 0.5 }, 4), { ok: false, reason: "wrong-type" })
+  assert.deepEqual(validateScore("2", 4), { ok: false, reason: "wrong-type" })
+})
+
+test("validateScore: rejects an out-of-range or non-finite score", () => {
+  for (const score of [-0.1, 4, 3.5, Number.NaN, Number.POSITIVE_INFINITY, "2"]) {
+    const result = validateScore({ type: "score", score, confidence: 0.5 }, 4)
+    assert.deepEqual(result, { ok: false, reason: "score-out-of-range" }, `score=${String(score)}`)
+  }
+})
+
+test("validateScore: rejects a non-unit-interval confidence when present", () => {
+  const result = validateScore({ type: "score", score: 1, confidence: 1.5 }, 4)
+  assert.deepEqual(result, { ok: false, reason: "confidence-out-of-range" })
+})
+
+test("validateScore: rejects a malformed legend or probabilities when present", () => {
+  assert.deepEqual(
+    validateScore({ type: "score", score: 1, legend: { "0": 7 } }, 4),
+    { ok: false, reason: "confidence-out-of-range" },
+  )
+  assert.deepEqual(
+    validateScore({ type: "score", score: 1, probabilities: { "0": 2 } }, 4),
+    { ok: false, reason: "confidence-out-of-range" },
+  )
+})
+
+test("validateScore: carries optional legend and probabilities into the verdict", () => {
+  const result = validateScore(
+    {
+      type: "score",
+      score: 1,
+      confidence: 0.7,
+      legend: { "0": "poor", "1": "ok", "2": "great" },
+      probabilities: { "0": 0.1, "1": 0.7, "2": 0.2 },
+    },
+    3,
+  )
+  assert.equal(result.ok, true)
+  if (result.ok) {
+    assert.equal(result.verdict.legend?.["1"], "ok")
+    assert.equal(result.verdict.probabilities?.["1"], 0.7)
+  }
+})
+
+test("validateScore: the upper bound scales with rubricLength", () => {
+  // The range is [0, rubricLength-1]; a longer rubric admits a higher score.
+  assert.equal(validateScore({ type: "score", score: 4 }, 5).ok, true)
+  assert.deepEqual(
+    validateScore({ type: "score", score: 5 }, 5),
+    { ok: false, reason: "score-out-of-range" },
+  )
 })
 
 test("classifyConfidence: above the floor is valid, below is abstain", () => {
