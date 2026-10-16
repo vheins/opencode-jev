@@ -6,6 +6,49 @@ Jev is not a drop-in model replacement. It answers named questions about a piece
 
 All Jev calls go through the configured router provider, which exposes a pass-through route at `POST /v1/systemone`. The router forwards the body untouched and returns the native System One JSON.
 
+## How it works
+
+The plugin sits between opencode events and the configured router provider. Each hook sends state plus a named question, receives a typed verdict, then branches. A missing key, timeout, error, or malformed verdict falls back to no-op so opencode continues with its native flow.
+
+### Runtime flow
+
+```mermaid
+flowchart TD
+  A["User message / tool call / event"] --> B["Hook intercepts"]
+  B --> C["tool.execute.before / permission.ask / chat.message / compacting / event / jev_decide"]
+  C --> D{"JEV key set?"}
+  D -->|No| E["Fail open: no-op + warn"]
+  D -->|Yes| F["POST /v1/systemone via router provider"]
+  F --> G{"OK within 10s?"}
+  G -->|No| E
+  G -->|Yes| H["Typed verdict: choice / score / noul"]
+  H --> I{"Branch on verdict"}
+  I -->|destructive + high| J["Block tool / deny prompt"]
+  I -->|read_only + high| K["Allow prompt"]
+  I -->|alert level| L["Toast + log"]
+  I -->|low or malformed| E
+```
+
+Verdict types map to hooks in the [Hook / event map](#hook--event-map): `choice` drives risk, routing, and severity labels; `noul` drives compaction and file review probabilities; `score` is available through the `tool.jev_decide` custom tool.
+
+### With and without the plugin
+
+```mermaid
+flowchart TD
+  subgraph VAN["opencode - no plugin"]
+    V1["User message or tool call"] --> V2["Native approval flow"]
+    V2 --> V3["Human decides / tool runs"]
+    V3 --> V4["No Jev calls"]
+  end
+  subgraph PLU["opencode + plugin"]
+    P1["User message or tool call"] --> P2["Hook consults Jev"]
+    P2 --> P3["Guardrail: block / allow / deny / toast"]
+    P3 --> P4["Fail open on no key or error"]
+  end
+```
+
+Without the plugin, every decision stays in the native approval flow. With the plugin, the same points consult Jev first and apply guardrails, while any Jev outage returns control to the native flow.
+
 ## Install
 
 ### From npm (recommended)
