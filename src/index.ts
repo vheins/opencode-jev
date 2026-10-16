@@ -36,7 +36,7 @@
  */
 
 import type { Event } from "@opencode-ai/sdk"
-import type { Hooks, Plugin } from "@opencode-ai/plugin"
+import type { Hooks, Plugin, PluginOptions } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { choice, noul, score, type Question } from "@typesafe-ai/sdk"
 
@@ -96,9 +96,9 @@ class JevBlockError extends Error {}
 /** Human-readable description of why Jev is disabled. */
 function disabledMessage(reason: DisabledReason): string {
   if (reason === "missing-key") {
-    return "No JEV key found (JEV_API_KEY or .jev-key); Jev guardrails are a no-op."
+    return "No JEV key found (apiKey option, JEV_API_KEY, or .jev-key); Jev guardrails are a no-op."
   }
-  return "JEV_BASE_URL is not set; Jev guardrails are a no-op (no default host is used)."
+  return "No base URL set (baseUrl option or JEV_BASE_URL); Jev guardrails are a no-op (no default host is used)."
 }
 
 /** Extract the concatenated text of a message's parts, bounded in length. */
@@ -144,7 +144,7 @@ function describeDecision(decision: RiskDecision): string {
   }
 }
 
-export default (async (input) => {
+export default (async (input, options?: PluginOptions) => {
   const { client } = input
 
   /**
@@ -185,9 +185,16 @@ export default (async (input) => {
     }
   }
 
-  const { config, disabledReason } = loadConfig()
+  const { config, disabledReason, warnings } = loadConfig(options ?? {})
   const warnOnce = new WarnOnce()
   const systemOne = new SystemOneClient(config, POLICY_VERSION)
+
+  for (const warning of warnings) {
+    await log("warn", "Ignored invalid JEV plugin option", {
+      field: warning.field,
+      reason: warning.reason,
+    })
+  }
 
   if (disabledReason) {
     await log("warn", disabledMessage(disabledReason))

@@ -1,10 +1,17 @@
 /**
  * Configuration resolution for the Jev plugin.
  *
- * Every value is read once at plugin load. `JEV_BASE_URL` is REQUIRED: the
- * plugin ships no default host, so an unset base URL disables Jev exactly like
- * a missing key. This keeps a custom router domain out of the source and
- * prevents an unconfigured install from silently calling a remote host.
+ * Every value is read once at plugin load. Resolution precedence is:
+ * opencode.json plugin options > environment variable > `~/.config/opencode/.jev-key`.
+ *
+ * `JEV_BASE_URL` (or the `baseUrl` option) is REQUIRED: the plugin ships no
+ * default host, so an unset base URL disables Jev exactly like a missing key.
+ * This keeps a custom router domain out of the source and prevents an
+ * unconfigured install from silently calling a remote host.
+ *
+ * Option values are untrusted JSON from `opencode.json`: a wrong-typed value is
+ * ignored (the environment value wins) and reported in `warnings`, never
+ * thrown. An option-supplied API key is never included in a warning message.
  *
  * @module
  */
@@ -96,14 +103,80 @@ export function parseThreshold(raw: string | undefined, fallback: number): numbe
   return parsed
 }
 
+/** Untrusted plugin options delivered by the opencode.json tuple form. */
+export type PluginOptions = Record<string, unknown>
+
+/** A single ignored-option warning; it names the field, never its value. */
+export type ConfigWarning = { readonly field: string; readonly reason: string }
+
 /**
- * Resolve the JEV API key from the environment, then the provider key file.
+ * Read a string plugin option.
  *
- * @returns The trimmed key, or `undefined` when neither source yields one.
+ * A wrong-typed or blank value is ignored (the environment value then wins)
+ * and reported as a warning. The value itself is never echoed, so an
+ * option-supplied secret cannot leak through a warning.
+ *
+ * @param options - The raw plugin options.
+ * @param field - The option key to read.
+ * @param warnings - Collector for ignored-option warnings.
+ * @returns The trimmed value, or `undefined` when absent or invalid.
  */
-export function resolveApiKey(): string | undefined {
-  const fromEnv = process.env.JEV_API_KEY?.trim()
-  if (fromEnv) return fromEnv
+function stringOption(
+  options: PluginOptions,
+  field: string,
+  warnings: ConfigWarning[],
+): string | undefined {
+  if (!(field in options)) return undefined
+  const raw = options[field]
+  if (typeof raw !== "string") {
+    warnings.push({ field, reason: "expected a string" })
+    return undefined
+  }
+  const trimmed = raw.trim()
+  if (trimmed === "") {
+    warnings.push({ field, reason: "empty string" })
+    return undefined
+  }
+  return trimmed
+}
+
+/**
+ * Read a numeric threshold plugin option.
+ *
+ * A non-finite or out-of-range value is ignored and reported, so a typo cannot
+ * widen a guardrail silently.
+ *
+ * @param options - The raw plugin options.
+ * @param field - The option key to read.
+ * @param fallback - Value used when the option is absent or invalid.
+ * @param warnings - Collector for ignored-option warnings.
+ * @returns The validated threshold, or `fallback`.
+ */
+function thresholdOption(
+  options: PluginOptions,
+  field: string,
+  fallback: number,
+  warnings: ConfigWarning[],
+): number {
+  if (!(field in options)) return fallback
+  const raw = options[field]
+  if (typeof raw !== "number") {
+    warnings.push({ field, reason: "expected a number" })
+    return fallback
+  }
+  if (!Number.isFinite(raw) || raw < 0 || raw > 1) {
+    warnings.push({ field, reason: "expected a number in [0, 1]" })
+    return fallback
+  }
+  return raw
+}
+
+/**
+ * Read the JEV API key from the provider key file only.
+ *
+ * @returns The trimmed key, or `undefined` when the file is absent or empty.
+ */
+export function readKeyFile(): string | undefined {
   try {
     const fromFile = readFileSync(DEFAULT_KEY_FILE, "utf8").trim()
     return fromFile || undefined
@@ -113,21 +186,48 @@ export function resolveApiKey(): string | undefined {
 }
 
 /**
- * Build the resolved configuration from the current environment.
+ * Resolve the JEV API key from the environment, then the provider key file.
  *
- * `JEV_BASE_URL` has no default: an unset or blank value disables Jev rather
- * than falling back to any host.
+ * @returns The trimmed key, or `undefined` when neither source yields one.
+ */
+export function resolveApiKey(): string | undefined {
+  const fromEnv = process.env.JEV_API_KEY?.trim()
+  if (fromEnv) return fromEnv
+  return readKeyFile()
+}
+
+/**
+ * Build the resolved configuration from plugin options, environment, and key file.
  *
+ * Precedence: `options` > `env` > `key`. A wrong-typed option is ignored and
+ * reported in `warnings` rather than thrown, so a malformed `opencode.json`
+ * cannot disable the plugin's safety behavior. The base URL has no default: an
+ * unset `baseUrl` option and an unset `JEV_BASE_URL` disable Jev rather than
+ * falling back to any host.
+ *
+ * @param options - Untrusted plugin options from the opencode.json tuple form.
  * @param env - Environment source; defaults to `process.env`.
- * @param key - Resolved key; defaults to {@link resolveApiKey}.
- * @returns The resolved configuration and, when disabled, the reason.
+ * @param keyFile - Key-file fallback; defaults to {@link readKeyFile}.
+ * @returns The resolved configuration, disabled reason, and ignored-option warnings.
  */
 export function loadConfig(
+  options: PluginOptions = {},
   env: NodeJS.ProcessEnv = process.env,
-  key: string | undefined = resolveApiKey(),
-): { readonly config: Config; readonly disabledReason?: DisabledReason } {
-  const baseUrl = env.JEV_BASE_URL?.trim() || undefined
-  const apiKey = key
+  keyFile: string | undefined = readKeyFile(),
+): {
+  readonly config: Config
+  readonly disabledReason?: DisabledReason
+  readonly warnings: readonly ConfigWarning[]
+} {
+  const warnings: ConfigWarning[] = []
+
+  const baseUrl =
+    stringOption(options, "baseUrl", warnings) ?? (env.JEV_BASE_URL?.trim() || undefined)
+  const model =
+    stringOption(options, "model", warnings) ?? (env.JEV_MODEL?.trim() || DEFAULT_MODEL)
+  const envKey = env.JEV_API_KEY?.trim() || undefined
+  const apiKey = stringOption(options, "apiKey", warnings) ?? envKey ?? keyFile
+
   let disabledReason: DisabledReason | undefined
   if (!apiKey) disabledReason = "missing-key"
   else if (!baseUrl) disabledReason = "missing-base-url"
@@ -137,22 +237,42 @@ export function loadConfig(
       enabled: disabledReason === undefined,
       apiKey,
       baseUrl,
-      model: env.JEV_MODEL?.trim() || DEFAULT_MODEL,
-      blockThreshold: parseThreshold(env.JEV_BLOCK_THRESHOLD, DEFAULT_BLOCK_THRESHOLD),
-      routeThreshold: parseThreshold(env.JEV_ROUTE_THRESHOLD, DEFAULT_ROUTE_THRESHOLD),
-      severityThreshold: parseThreshold(env.JEV_SEVERITY_THRESHOLD, DEFAULT_SEVERITY_THRESHOLD),
-      compactThreshold: parseThreshold(
-        env.JEV_COMPACT_THRESHOLD,
-        DEFAULT_COMPACT_THRESHOLD,
+      model,
+      blockThreshold: thresholdOption(
+        options,
+        "blockThreshold",
+        parseThreshold(env.JEV_BLOCK_THRESHOLD, DEFAULT_BLOCK_THRESHOLD),
+        warnings,
       ),
-      fileReviewThreshold: parseThreshold(
-        env.JEV_FILE_REVIEW_THRESHOLD,
-        DEFAULT_FILE_REVIEW_THRESHOLD,
+      routeThreshold: thresholdOption(
+        options,
+        "routeThreshold",
+        parseThreshold(env.JEV_ROUTE_THRESHOLD, DEFAULT_ROUTE_THRESHOLD),
+        warnings,
+      ),
+      severityThreshold: thresholdOption(
+        options,
+        "severityThreshold",
+        parseThreshold(env.JEV_SEVERITY_THRESHOLD, DEFAULT_SEVERITY_THRESHOLD),
+        warnings,
+      ),
+      compactThreshold: thresholdOption(
+        options,
+        "compactThreshold",
+        parseThreshold(env.JEV_COMPACT_THRESHOLD, DEFAULT_COMPACT_THRESHOLD),
+        warnings,
+      ),
+      fileReviewThreshold: thresholdOption(
+        options,
+        "fileReviewThreshold",
+        parseThreshold(env.JEV_FILE_REVIEW_THRESHOLD, DEFAULT_FILE_REVIEW_THRESHOLD),
+        warnings,
       ),
       timeoutMs: REQUEST_TIMEOUT_MS,
       cacheTtlMs: DEFAULT_CACHE_TTL_MS,
       maxConcurrent: MAX_CONCURRENT_REQUESTS,
     },
     ...(disabledReason ? { disabledReason } : {}),
+    warnings,
   }
 }

@@ -333,7 +333,7 @@ test("tool.jev_decide: returns a disabled message when Jev is not configured", a
     { state: "{}", type: "noul", instructions: "?" },
     toolContext(),
   )
-  assert.match(String(result), /JEV_BASE_URL is not set/)
+  assert.match(String(result), /No base URL set/)
 })
 
 test("tool.jev_decide: returns the typed answer when configured", async () => {
@@ -384,6 +384,75 @@ test("tool.jev_decide: score request returns the score answer through the provid
   assert.equal(seenType, "score", "the request must carry a score question")
   assert.match(String(result), /"type":"score"/)
   assert.match(String(result), /"score":0.75/)
+})
+
+test("plugin: options.baseUrl configures Jev without any JEV_BASE_URL env", async () => {
+  process.env = { ...originalEnv, JEV_API_KEY: "env-key" }
+  delete process.env.JEV_BASE_URL
+  const { input, logs } = stubInput()
+  let calledUrl: string | undefined
+  globalThis.fetch = (async (url: string) => {
+    calledUrl = url
+    return new Response(noulBody("risk", 0.9), { status: 200 })
+  }) as typeof fetch
+  const hooks = await plugin(input, { baseUrl: "https://opt.example/v1/systemone" })
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo hi" } })
+  assert.equal(calledUrl, "https://opt.example/v1/systemone", "the option base URL must be used")
+  const configured = logs.some((entry) => entry.body.message === "Jev router configured")
+  assert.equal(configured, true)
+})
+
+test("plugin: options.apiKey is sent as the bearer token and never logged", async () => {
+  process.env = { ...originalEnv }
+  delete process.env.JEV_API_KEY
+  delete process.env.JEV_BASE_URL
+  const { input, logs } = stubInput()
+  const secret = "sk-option-only-secret"
+  let auth: string | undefined
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    const headers = init?.headers as Record<string, string> | undefined
+    auth = headers?.Authorization
+    return new Response(noulBody("risk", 0.9), { status: 200 })
+  }) as typeof fetch
+  const hooks = await plugin(input, { baseUrl: "https://opt.example/v1", apiKey: secret })
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo hi" } })
+  assert.equal(auth, `Bearer ${secret}`)
+  assert.equal(JSON.stringify(logs).includes(secret), false, "the option key must never be logged")
+})
+
+test("plugin: an invalid option is ignored with a warning and Jev still runs on env", async () => {
+  process.env = { ...originalEnv, JEV_API_KEY: "env-key", JEV_BASE_URL: "https://env.example/v1" }
+  const { input, logs } = stubInput()
+  globalThis.fetch = (async () => new Response(noulBody("risk", 0.9), { status: 200 })) as typeof fetch
+  const hooks = await plugin(input, { baseUrl: 123 })
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo hi" } })
+  const warned = logs.some(
+    (entry) => entry.body.message === "Ignored invalid JEV plugin option" && entry.body.extra !== undefined,
+  )
+  assert.equal(warned, true, "an invalid option must produce a warning")
+})
+
+test("plugin: with no base URL from options or env, Jev degrades to a no-op", async () => {
+  process.env = { ...originalEnv, JEV_API_KEY: "env-key" }
+  delete process.env.JEV_BASE_URL
+  const { input, logs } = stubInput()
+  let called = false
+  globalThis.fetch = (async () => {
+    called = true
+    return new Response(noulBody("risk", 0.9), { status: 200 })
+  }) as typeof fetch
+  const hooks = await plugin(input, {})
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm -rf /" } })
+  assert.equal(called, false)
+  assert.equal(logs.some((entry) => entry.body.level === "warn"), true)
 })
 
 /**
