@@ -179,6 +179,77 @@ test("tool.jev_decide: a distinct question is NOT suppressed", async () => {
   assert.equal(calls(), 2, "a distinct explicit question must each reach the provider")
 })
 
+// --- FIX-8: systemOneCalls must equal triggered -----------------------------
+
+/** A malformed noul body (missing `noul`), which `judge` rejects as invalid. */
+function malformedNoulBody(): string {
+  return JSON.stringify({
+    model: "oc/jev-1.13-free",
+    answers: { judgment: { type: "noul" } },
+    usage: { input_tokens: 1, output_tokens: 1 },
+  })
+}
+
+test("tool.jev_metrics: a triggered + an identical judgement -> systemOneCalls == triggered (FIX-8)", async () => {
+  countingFetch(() => noulBody("judgment", 0.8))
+  const hooks = await plugin(stubInput())
+  const decide = hooks.tool?.jev_decide
+  const metrics = hooks.tool?.jev_metrics
+  assert.ok(decide)
+  assert.ok(metrics)
+  const args = { state: "{}", type: "noul" as const, instructions: "same question" }
+  await decide.execute(args, toolContext())
+  await decide.execute(args, toolContext())
+  const snap = JSON.parse(String(await metrics.execute({}, toolContext()))) as Record<string, unknown>
+  assert.equal(snap.triggered, 1, "one unique judgement triggers")
+  assert.equal(snap.reused, 1, "the identical repeat is reused")
+  assert.equal(snap.systemOneCalls, 1, "the reused judgement must not count as a model call")
+  assert.equal(snap.systemOneCalls, snap.triggered, "each triggered judgement is exactly one model call")
+})
+
+test("tool.jev_metrics: two distinct decisions -> systemOneCalls == triggered (FIX-8)", async () => {
+  countingFetch(() => noulBody("judgment", 0.8))
+  const hooks = await plugin(stubInput())
+  const decide = hooks.tool?.jev_decide
+  const metrics = hooks.tool?.jev_metrics
+  assert.ok(decide)
+  assert.ok(metrics)
+  await decide.execute({ state: "{}", type: "noul", instructions: "question A" }, toolContext())
+  await decide.execute({ state: "{}", type: "noul", instructions: "question B" }, toolContext())
+  const snap = JSON.parse(String(await metrics.execute({}, toolContext()))) as Record<string, unknown>
+  assert.equal(snap.triggered, 2)
+  assert.equal(snap.reused, 0)
+  assert.equal(snap.systemOneCalls, 2)
+})
+
+test("mutation proof: a reuse the handler cannot serve is a trigger, not a double-count (FIX-8)", async () => {
+  // Faithful reproduction of the live FIX-8 evidence: one unique judgement, then
+  // an identical question that returns a MALFORMED (invalid) answer so nothing is
+  // remembered, then the same question again. The third call is a gate dedup that
+  // the handler cannot serve (no replayable value), so it falls through and asks
+  // the model again. If the gate reported that reuse anyway, the judgement would
+  // be counted as reused AND as a model call, so `systemOneCalls` (3) would exceed
+  // `triggered` (2) — exactly the observed bug. Removing the `servable` guard
+  // flips this test red.
+  let body = noulBody("judgment", 0.8)
+  globalThis.fetch = (async () => new Response(body, { status: 200 })) as typeof fetch
+  const hooks = await plugin(stubInput())
+  const decide = hooks.tool?.jev_decide
+  const metrics = hooks.tool?.jev_metrics
+  assert.ok(decide)
+  assert.ok(metrics)
+  const A = { state: "{}", type: "noul" as const, instructions: "DEDUP-TEST-A" }
+  await decide.execute({ state: "{}", type: "noul", instructions: "unique-proceed" }, toolContext())
+  body = malformedNoulBody() // the A trigger produces no rememberable answer
+  await decide.execute(A, toolContext())
+  await decide.execute(A, toolContext()) // unservable dedup -> must be a trigger
+  const snap = JSON.parse(String(await metrics.execute({}, toolContext()))) as Record<string, unknown>
+  assert.equal(snap.judgements, 3)
+  assert.equal(snap.triggered, 3, "each of the three judgements reached the model path")
+  assert.equal(snap.reused, 0, "an unservable reuse must not be recorded as a reuse")
+  assert.equal(snap.systemOneCalls, snap.triggered, "the corrected invariant must hold")
+})
+
 test("tool.jev_metrics: reports zeroed counters before any judgement (no IO)", async () => {
   const hooks = await plugin(stubInput())
   const metrics = hooks.tool?.jev_metrics

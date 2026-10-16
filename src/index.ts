@@ -545,6 +545,13 @@ export default (async (input, options?: PluginOptions) => {
       // questions) so a repeated identical call reuses the result instead of
       // re-asking. Cooldown is disabled here — a distinct explicit question is a
       // distinct logical decision and must never be collapsed into another.
+      //
+      // A reuse is only reported when a replayable answer actually exists: this
+      // handler must RETURN that answer, so an earlier identical judgement that
+      // produced no valid answer (invalid/unavailable, nothing remembered) cannot
+      // be served. Without the `servable` guard the gate would report a reuse the
+      // handler then ignores, ask the model anyway, and count the judgement as
+      // BOTH reused and a model call — breaking `systemOneCalls == triggered`.
       const fingerprint = safeStringify({
         type: args.type,
         instructions: args.instructions,
@@ -556,6 +563,7 @@ export default (async (input, options?: PluginOptions) => {
       })
       const gate = gateJudgement(triggerGate, metrics, "tool.jev_decide", fingerprint, {
         cooldown: false,
+        servable: () => typeof triggerGate.replay("tool.jev_decide") === "string",
       })
       if (gate.kind === "reuse") {
         await log("info", "jev_decide reused an identical judgement", { type: args.type })

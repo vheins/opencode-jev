@@ -55,6 +55,20 @@ export type TriggerDecideOptions = {
    * decision and must never be collapsed into another.
    */
   readonly cooldown?: boolean
+  /**
+   * Whether the caller can actually serve a reuse for this key.
+   *
+   * A reuse is only a reuse if the caller can honor it. A caller whose reuse is
+   * a void deferral (the automatic tool gate) is always servable and omits this.
+   * A caller that must RETURN a remembered value (e.g. `jev_decide`) passes a
+   * predicate that reports whether a replayable value exists: when it does not,
+   * the gate must NOT report a reuse, because the caller would fall through and
+   * ask the model after all. Reporting a reuse there would count the judgement
+   * as reused AND as a model call, breaking `systemOneCalls == triggered`.
+   *
+   * Defaults to always-servable.
+   */
+  readonly servable?: () => boolean
 }
 
 /** One remembered logical action: its fingerprint, timestamp, and replay value. */
@@ -89,19 +103,25 @@ export class TriggerGate {
    *
    * A previous entry within the window is reused when its fingerprint matches
    * (dedup) or, when cooldown is enabled, for any fingerprint under the same key
-   * (cooldown). Otherwise the key is stamped and the caller must trigger.
+   * (cooldown), and only when the caller can actually serve the reuse (see
+   * {@link TriggerDecideOptions.servable}). Otherwise the key is stamped and the
+   * caller must trigger.
    *
    * @param key - The logical-action key (tool + safe equivalence scope).
    * @param fingerprint - The exact judgement identity (tool + scope + questions).
-   * @param options - Optional per-call tuning (cooldown on/off).
+   * @param options - Optional per-call tuning (cooldown on/off, servability).
    * @returns `trigger` when the model must be asked, else the reuse reason.
    */
   decide(key: string, fingerprint: string, options?: TriggerDecideOptions): TriggerOutcome {
     const cooldown = options?.cooldown ?? true
+    const servable = options?.servable
     const previous = this.entries.get(key)
     if (previous !== undefined && this.now() - previous.at < this.cooldownMs) {
-      if (previous.fingerprint === fingerprint) return { kind: "reuse", reason: "dedup" }
-      if (cooldown) return { kind: "reuse", reason: "cooldown" }
+      const canServe = servable === undefined || servable()
+      if (canServe) {
+        if (previous.fingerprint === fingerprint) return { kind: "reuse", reason: "dedup" }
+        if (cooldown) return { kind: "reuse", reason: "cooldown" }
+      }
     }
     this.entries.set(key, { fingerprint, at: this.now() })
     return { kind: "trigger" }
