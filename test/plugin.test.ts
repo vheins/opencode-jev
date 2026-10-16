@@ -793,14 +793,15 @@ test("fail-open: a destructive hint that times out does NOT throw", async () => 
 /**
  * Cache-scope integration tests.
  *
- * These prove the two halves of the cache optimization at the real hook
- * boundary: equivalent actions now hit the cache, and a destructive action can
- * never reuse a cached non-destructive verdict. A mutation that keys the cache
- * on the raw args blob fails the hit test; a mutation that drops the safety
- * discriminator fails the block test.
+ * These prove the safety boundary at the real hook boundary: distinct `unknown`
+ * actions never share a cache entry (so a cached non-destructive verdict can
+ * never be served to a call the model could verdict destructive), the same
+ * destructive pattern still hits, and a destructive call can never reuse a
+ * cached non-destructive verdict. A mutation that passes a scope for `unknown`
+ * fails the unknown-miss test.
  */
 
-test("tool.execute.before: equivalent bash calls hit the cache (one network call)", async () => {
+test("tool.execute.before: distinct unknown actions never share a cache entry (two calls)", async () => {
   const { input } = stubInput()
   let calls = 0
   routeFetch(() => {
@@ -811,8 +812,23 @@ test("tool.execute.before: equivalent bash calls hit the cache (one network call
   const before = hooks["tool.execute.before"]
   assert.ok(before)
   await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo one > a.txt" } })
-  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo two > b.txt" } })
-  assert.equal(calls, 1, "equivalent same-safety-class calls must share a cache entry")
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm file.txt" } })
+  assert.equal(calls, 2, "distinct unknown actions must each reach the provider (no cross-args hit)")
+})
+
+test("tool.execute.before: the same destructive pattern still shares one cache entry", async () => {
+  const { input } = stubInput()
+  let calls = 0
+  routeFetch(() => {
+    calls += 1
+    return new Response(choiceBody("risk", "mutating", 0.9), { status: 200 })
+  })
+  const hooks = await plugin(input)
+  const before = hooks["tool.execute.before"]
+  assert.ok(before)
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm -rf /tmp/one" } })
+  await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm -rf /var/two" } })
+  assert.equal(calls, 1, "the same destructive pattern is a safe equivalence and must hit")
 })
 
 test("tool.execute.before: a destructive call does NOT reuse a cached non-destructive verdict", async () => {

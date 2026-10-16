@@ -107,21 +107,27 @@ export function classifyLocally(tool: string, args: unknown): LocalClassificatio
 }
 
 /**
- * Derive a stable, safety-preserving cache scope for a tool action.
+ * Derive a safety-preserving cache scope for a tool action.
  *
  * The scope is the deterministic local classification of the action, never the
- * full argument blob: two calls share a scope only when they are in the same
- * safety class. A destructive hint is keyed by the exact pattern it matched, so
- * a destructive call can never reuse a cached non-destructive verdict, and two
- * distinct destructive patterns never collide. Non-destructive, non-read-only
- * actions share the `unknown` class for the same tool, which is the equivalence
- * the cache exists to serve. The tool id is part of the scope so two tools with
- * the same classification can never share a verdict.
+ * full argument blob. A destructive hint is keyed by the exact pattern it
+ * matched, so a destructive call can never reuse a cached non-destructive
+ * verdict and two distinct destructive patterns never collide. The tool id is
+ * part of the scope so two tools with the same classification can never share a
+ * verdict.
+ *
+ * The `unknown` class is deliberately NOT a safe equivalence class: two unknown
+ * actions of the same tool (e.g. `echo one > a.txt` and `rm file.txt`, which
+ * matches no {@link DESTRUCTIVE_HINTS} entry) can still be verdict `mutating`
+ * and `destructive` respectively, so sharing one key could serve a cached
+ * non-destructive verdict to a destructive call. A caller must therefore pass a
+ * scope ONLY for `read_only`/`destructive_hint`, and OMIT it for `unknown` so
+ * the client falls back to the full-state key.
  *
  * @param tool - The tool id being invoked.
  * @param args - The tool arguments.
- * @returns A deterministic scope string (`<tool>\0read_only`, `<tool>\0unknown`,
- *   or `<tool>\0destructive:<matched-pattern>`).
+ * @returns A deterministic scope string (`<tool>\0read_only`,
+ *   `<tool>\0unknown`, or `<tool>\0destructive:<matched-pattern>`).
  */
 export function riskCacheScope(tool: string, args: unknown): string {
   const local = classifyLocally(tool, args)

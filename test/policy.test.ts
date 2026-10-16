@@ -98,17 +98,22 @@ test("classifyFileSensitivity: malformed input never throws and scores 0", () =>
 /**
  * Cache-scope tests.
  *
- * The scope is the safety discriminator in the client cache key. It must be
- * stable for genuinely-equivalent calls (same tool, same safety class) and must
- * separate any two calls that could yield a different risk verdict. A
- * mutation that drops the tool id, collapses the destructive signal, or keys on
- * the raw args blob makes at least one of these fail.
+ * The scope is the safety discriminator the client cache key uses. It must
+ * separate any two calls that could yield a different risk verdict: destructive
+ * hints are keyed by their matched pattern, and the tool id is always prefixed.
+ * The `unknown` class is intentionally coarse and is NOT a safe equivalence key
+ * (two unknown actions can still be verdict differently), so `tool.execute.before`
+ * omits the scope for `unknown` and falls back to the full-state key — proven at
+ * the hook boundary in `plugin.test.ts`.
  */
 
-test("riskCacheScope: equivalent non-destructive calls of the same tool share a scope", () => {
+test("riskCacheScope: the unknown class is coarse and unsafe as an equivalence key", () => {
   const a = riskCacheScope("bash", { command: "echo one > a.txt" })
-  const b = riskCacheScope("bash", { command: "echo two > b.txt" })
-  assert.equal(a, b, "different args in the same safety class must share a scope")
+  const b = riskCacheScope("bash", { command: "rm file.txt" })
+  // Neither arg matches a DESTRUCTIVE_HINT, so both collapse to the same coarse
+  // label. This is exactly why the hook omits the scope for unknown actions.
+  assert.equal(a, b, "the unknown class does not separate these two actions")
+  assert.equal(a, "bash\u0000unknown")
 })
 
 test("riskCacheScope: a read-only tool and a destructive call never share a scope", () => {
