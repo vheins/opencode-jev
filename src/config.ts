@@ -46,6 +46,18 @@ export const DEFAULT_COMPACT_THRESHOLD = 0.75
 /** Default probability above which a security-sensitive file edit surfaces a toast. */
 export const DEFAULT_FILE_REVIEW_THRESHOLD = 0.8
 
+/** Default decision-log path; an empty string or `"off"` disables logging. */
+export const DEFAULT_DECISION_LOG_PATH = join(homedir(), ".config", "opencode", "jev-decisions.log")
+
+/** Default decision-log size cap (bytes) before rotation. */
+export const DEFAULT_DECISION_LOG_MAX_BYTES = 1_000_000
+
+/** Default number of rotated decision-log copies to keep. */
+export const DEFAULT_DECISION_LOG_BACKUPS = 3
+
+/** Default for whether every decision also surfaces a toast. */
+export const DEFAULT_TOAST_DECISIONS = false
+
 /** Per-request timeout (ms) for a Jev call, so a hung router never stalls a hook. */
 export const REQUEST_TIMEOUT_MS = 10_000
 
@@ -75,6 +87,14 @@ export type Config = {
   readonly compactThreshold: number
   /** Toast a security-sensitive file edit at or above this probability. */
   readonly fileReviewThreshold: number
+  /** Decision-log file path; empty or `"off"` disables logging. */
+  readonly decisionLogPath: string
+  /** Rotate the decision log once it reaches this many bytes. */
+  readonly decisionLogMaxBytes: number
+  /** Number of rotated decision-log copies to keep. */
+  readonly decisionLogBackups: number
+  /** Whether every decision also surfaces a TUI toast. */
+  readonly toastDecisions: boolean
   /** Per-request timeout (ms). */
   readonly timeoutMs: number
   /** Decision cache TTL (ms). */
@@ -101,6 +121,39 @@ export function parseThreshold(raw: string | undefined, fallback: number): numbe
   const parsed = Number(raw)
   if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) return fallback
   return parsed
+}
+
+/**
+ * Parse a non-negative integer from an environment value.
+ *
+ * @param raw - Raw environment string, or `undefined` when unset.
+ * @param fallback - Value returned when the input is missing or invalid.
+ * @returns The parsed integer, or `fallback`.
+ */
+export function parseCount(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed < 0) return fallback
+  return parsed
+}
+
+/**
+ * Parse a boolean from an environment value.
+ *
+ * Accepts `1`/`true`/`yes`/`on` (case-insensitive) as true and
+ * `0`/`false`/`no`/`off` as false; anything else falls back.
+ *
+ * @param raw - Raw environment string, or `undefined` when unset.
+ * @param fallback - Value returned when the input is missing or unrecognized.
+ * @returns The parsed boolean, or `fallback`.
+ */
+export function parseBoolean(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined) return fallback
+  const value = raw.trim().toLowerCase()
+  if (value === "") return fallback
+  if (["1", "true", "yes", "on"].includes(value)) return true
+  if (["0", "false", "no", "off"].includes(value)) return false
+  return fallback
 }
 
 /** Untrusted plugin options delivered by the opencode.json tuple form. */
@@ -172,6 +225,60 @@ function thresholdOption(
 }
 
 /**
+ * Read a non-negative integer plugin option.
+ *
+ * A non-integer or negative value is ignored and reported, so a malformed
+ * rotation setting cannot disable the cap silently.
+ *
+ * @param options - The raw plugin options.
+ * @param field - The option key to read.
+ * @param fallback - Value used when the option is absent or invalid.
+ * @param warnings - Collector for ignored-option warnings.
+ * @returns The validated integer, or `fallback`.
+ */
+function countOption(
+  options: PluginOptions,
+  field: string,
+  fallback: number,
+  warnings: ConfigWarning[],
+): number {
+  if (!(field in options)) return fallback
+  const raw = options[field]
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+    warnings.push({ field, reason: "expected a non-negative integer" })
+    return fallback
+  }
+  return raw
+}
+
+/**
+ * Read a boolean plugin option.
+ *
+ * A non-boolean value is ignored and reported, so a string like `"false"`
+ * cannot silently flip a flag on.
+ *
+ * @param options - The raw plugin options.
+ * @param field - The option key to read.
+ * @param fallback - Value used when the option is absent or invalid.
+ * @param warnings - Collector for ignored-option warnings.
+ * @returns The validated boolean, or `fallback`.
+ */
+function booleanOption(
+  options: PluginOptions,
+  field: string,
+  fallback: boolean,
+  warnings: ConfigWarning[],
+): boolean {
+  if (!(field in options)) return fallback
+  const raw = options[field]
+  if (typeof raw !== "boolean") {
+    warnings.push({ field, reason: "expected a boolean" })
+    return fallback
+  }
+  return raw
+}
+
+/**
  * Read the JEV API key from the provider key file only.
  *
  * @returns The trimmed key, or `undefined` when the file is absent or empty.
@@ -228,6 +335,21 @@ export function loadConfig(
   const envKey = env.JEV_API_KEY?.trim() || undefined
   const apiKey = stringOption(options, "apiKey", warnings) ?? envKey ?? keyFile
 
+  // A blank `decisionLogPath` option is meaningful: it disables logging. So it
+  // is read directly rather than through `stringOption`, which rejects blanks.
+  let decisionLogPath: string
+  if ("decisionLogPath" in options) {
+    const raw = options.decisionLogPath
+    if (typeof raw === "string") {
+      decisionLogPath = raw.trim()
+    } else {
+      warnings.push({ field: "decisionLogPath", reason: "expected a string" })
+      decisionLogPath = env.JEV_DECISION_LOG?.trim() || DEFAULT_DECISION_LOG_PATH
+    }
+  } else {
+    decisionLogPath = env.JEV_DECISION_LOG?.trim() || DEFAULT_DECISION_LOG_PATH
+  }
+
   let disabledReason: DisabledReason | undefined
   if (!apiKey) disabledReason = "missing-key"
   else if (!baseUrl) disabledReason = "missing-base-url"
@@ -266,6 +388,25 @@ export function loadConfig(
         options,
         "fileReviewThreshold",
         parseThreshold(env.JEV_FILE_REVIEW_THRESHOLD, DEFAULT_FILE_REVIEW_THRESHOLD),
+        warnings,
+      ),
+      decisionLogPath,
+      decisionLogMaxBytes: countOption(
+        options,
+        "decisionLogMaxBytes",
+        parseCount(env.JEV_DECISION_LOG_MAX_BYTES, DEFAULT_DECISION_LOG_MAX_BYTES),
+        warnings,
+      ),
+      decisionLogBackups: countOption(
+        options,
+        "decisionLogBackups",
+        parseCount(env.JEV_DECISION_LOG_BACKUPS, DEFAULT_DECISION_LOG_BACKUPS),
+        warnings,
+      ),
+      toastDecisions: booleanOption(
+        options,
+        "toastDecisions",
+        parseBoolean(env.JEV_TOAST_DECISIONS, DEFAULT_TOAST_DECISIONS),
         warnings,
       ),
       timeoutMs: REQUEST_TIMEOUT_MS,

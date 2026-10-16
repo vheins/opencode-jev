@@ -13,6 +13,9 @@
  */
 
 import assert from "node:assert/strict"
+import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { afterEach, beforeEach, test } from "node:test"
 
 import type { PluginInput, ToolContext } from "@opencode-ai/plugin"
@@ -121,6 +124,10 @@ beforeEach(() => {
   delete process.env.JEV_SEVERITY_THRESHOLD
   delete process.env.JEV_COMPACT_THRESHOLD
   delete process.env.JEV_FILE_REVIEW_THRESHOLD
+  // Disable the decision log so these hook tests never write to the real
+  // ~/.config/opencode/jev-decisions.log on the host.
+  process.env.JEV_DECISION_LOG = "off"
+  delete process.env.JEV_TOAST_DECISIONS
 })
 
 afterEach(() => {
@@ -400,7 +407,10 @@ test("plugin: options.baseUrl configures Jev without any JEV_BASE_URL env", asyn
   assert.ok(before)
   await before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "echo hi" } })
   assert.equal(calledUrl, "https://opt.example/v1/systemone", "the option base URL must be used")
-  const configured = logs.some((entry) => entry.body.message === "Jev router configured")
+  const configured = logs.some(
+    (entry) =>
+      typeof entry.body.message === "string" && entry.body.message.startsWith("Jev enabled:"),
+  )
   assert.equal(configured, true)
 })
 
@@ -604,4 +614,91 @@ test("boundary: fileReview just below fileReviewThreshold does NOT toast", async
   assert.ok(event)
   await event({ event: { type: "file.edited", properties: { file: ".env" } } as never })
   assert.equal(toasts.length, 0)
+})
+
+/**
+ * Decision-observability tests: the JSON decision log and the opt-in
+ * "toast every decision" mode. These use a temp log path so they never touch
+ * the real `~/.config/opencode/jev-decisions.log`.
+ */
+
+test("plugin: startup proof line names model, host, and key presence but never the key", async () => {
+  const secret = "sk-startup-secret-value"
+  process.env = { ...originalEnv, JEV_API_KEY: secret, JEV_BASE_URL: "https://router.example/v1/systemone" }
+  const { input, logs } = stubInput()
+  const hooks = await plugin(input)
+  const proof = logs.find(
+    (entry) =>
+      typeof entry.body.message === "string" && entry.body.message.startsWith("Jev enabled:"),
+  )
+  assert.ok(proof, "an enabled plugin must emit a startup proof line")
+  const message = String(proof.body.message)
+  assert.match(message, /model=oc\/jev-1\.13-free/)
+  assert.match(message, /baseUrl=router\.example/)
+  assert.match(message, /key=set/)
+  assert.equal(message.includes(secret), false, "the key value must never appear")
+  assert.equal(JSON.stringify(logs).includes(secret), false)
+  assert.equal(Object.hasOwn(hooks, "permission.ask"), false)
+})
+
+test("plugin: writes a decision-log line for a valid tool verdict and never leaks the key", async () => {
+  const logDir = await mkdtemp(join(tmpdir(), "jev-plugin-log-"))
+  try {
+    const logPath = join(logDir, "decisions.log")
+    const secret = "sk-decision-log-secret"
+    process.env = {
+      ...originalEnv,
+      JEV_API_KEY: secret,
+      JEV_BASE_URL: "https://router.example/v1/systemone",
+      JEV_DECISION_LOG: logPath,
+    }
+    const { input, logs } = stubInput()
+    routeFetch(() => new Response(choiceBody("risk", "destructive", 0.95), { status: 200 }))
+    const hooks = await plugin(input)
+    const before = hooks["tool.execute.before"]
+    assert.ok(before)
+    await assert.rejects(
+      () => before({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "rm -rf /tmp/x" } }),
+      /Blocked destructive tool/,
+    )
+    const raw = await readFile(logPath, "utf8")
+    const entry = JSON.parse(raw.split("\n").filter(Boolean)[0] ?? "{}") as Record<string, unknown>
+    assert.equal(entry.hook, "tool.execute.before")
+    assert.equal(entry.kind, "valid")
+    assert.equal(entry.decision, "destructive")
+    assert.equal(entry.action, "block")
+    assert.equal(raw.includes(secret), false, "the decision log must never contain the api key")
+    assert.equal(JSON.stringify(logs).includes(secret), false, "server logs must never contain the api key")
+  } finally {
+    await rm(logDir, { recursive: true, force: true })
+  }
+})
+
+test("plugin: toastDecisions=false adds no toast beyond the default decision toasts", async () => {
+  process.env = { ...originalEnv, JEV_API_KEY: "test-key", JEV_BASE_URL: "https://router.example/v1/systemone" }
+  const { input, toasts } = stubInput()
+  routeFetch(() => new Response(choiceBody("route", "code_only", 0.9), { status: 200 }))
+  const hooks = await plugin(input)
+  const chat = hooks["chat.message"]
+  assert.ok(chat)
+  await chat(
+    { sessionID: "s" },
+    { message: {} as never, parts: [{ type: "text", text: "read the file" } as never] },
+  )
+  assert.equal(toasts.length, 0, "a non-default decision must not toast when the mode is off")
+})
+
+test("plugin: toastDecisions=true toasts a decision that would otherwise be silent", async () => {
+  process.env = { ...originalEnv, JEV_API_KEY: "test-key", JEV_BASE_URL: "https://router.example/v1/systemone" }
+  const { input, toasts } = stubInput()
+  routeFetch(() => new Response(choiceBody("route", "code_only", 0.9), { status: 200 }))
+  const hooks = await plugin(input, { toastDecisions: true })
+  const chat = hooks["chat.message"]
+  assert.ok(chat)
+  await chat(
+    { sessionID: "s" },
+    { message: {} as never, parts: [{ type: "text", text: "read the file" } as never] },
+  )
+  // One startup toast + one decision toast.
+  assert.equal(toasts.length, 2)
 })

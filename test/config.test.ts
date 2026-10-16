@@ -13,7 +13,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { loadConfig, parseThreshold } from "../src/config.ts"
+import { loadConfig, parseBoolean, parseCount, parseThreshold } from "../src/config.ts"
 
 test("loadConfig: unset JEV_BASE_URL disables Jev with missing-base-url", () => {
   const { config, disabledReason } = loadConfig({}, { JEV_API_KEY: "secret" }, "secret")
@@ -192,4 +192,106 @@ test("loadConfig: an unknown option key is ignored without a warning", () => {
     "k",
   )
   assert.equal(warnings.length, 0)
+})
+
+test("parseCount: non-negative integers pass; missing/invalid fall back", () => {
+  assert.equal(parseCount("5", 3), 5)
+  assert.equal(parseCount("0", 3), 0)
+  assert.equal(parseCount(undefined, 3), 3)
+  assert.equal(parseCount("", 3), 3)
+  assert.equal(parseCount("-1", 3), 3)
+  assert.equal(parseCount("1.5", 3), 3)
+  assert.equal(parseCount("abc", 3), 3)
+})
+
+test("parseBoolean: truthy/falsy strings parse; missing/unrecognized fall back", () => {
+  assert.equal(parseBoolean("true", false), true)
+  assert.equal(parseBoolean("1", false), true)
+  assert.equal(parseBoolean("YES", false), true)
+  assert.equal(parseBoolean("on", false), true)
+  assert.equal(parseBoolean("false", true), false)
+  assert.equal(parseBoolean("0", true), false)
+  assert.equal(parseBoolean("off", true), false)
+  assert.equal(parseBoolean(undefined, true), true)
+  assert.equal(parseBoolean("maybe", true), true)
+})
+
+test("loadConfig: decision-log fields default when nothing is set", () => {
+  const { config } = loadConfig(
+    {},
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.match(config.decisionLogPath, /jev-decisions\.log$/)
+  assert.equal(config.decisionLogMaxBytes, 1_000_000)
+  assert.equal(config.decisionLogBackups, 3)
+  assert.equal(config.toastDecisions, false)
+})
+
+test("loadConfig: decision-log env overrides are honored", () => {
+  const { config } = loadConfig(
+    {},
+    {
+      JEV_API_KEY: "k",
+      JEV_BASE_URL: "https://env.example/v1",
+      JEV_DECISION_LOG: "/tmp/jev-env.log",
+      JEV_DECISION_LOG_MAX_BYTES: "2048",
+      JEV_DECISION_LOG_BACKUPS: "5",
+      JEV_TOAST_DECISIONS: "true",
+    },
+    "k",
+  )
+  assert.equal(config.decisionLogPath, "/tmp/jev-env.log")
+  assert.equal(config.decisionLogMaxBytes, 2048)
+  assert.equal(config.decisionLogBackups, 5)
+  assert.equal(config.toastDecisions, true)
+})
+
+test("loadConfig: options override the decision-log env (options > env)", () => {
+  const { config } = loadConfig(
+    {
+      decisionLogPath: "/tmp/jev-opt.log",
+      decisionLogMaxBytes: 4096,
+      decisionLogBackups: 1,
+      toastDecisions: true,
+    },
+    {
+      JEV_API_KEY: "k",
+      JEV_BASE_URL: "https://env.example/v1",
+      JEV_DECISION_LOG: "/tmp/jev-env.log",
+      JEV_DECISION_LOG_MAX_BYTES: "2048",
+      JEV_DECISION_LOG_BACKUPS: "5",
+      JEV_TOAST_DECISIONS: "false",
+    },
+    "k",
+  )
+  assert.equal(config.decisionLogPath, "/tmp/jev-opt.log")
+  assert.equal(config.decisionLogMaxBytes, 4096)
+  assert.equal(config.decisionLogBackups, 1)
+  assert.equal(config.toastDecisions, true)
+})
+
+test("loadConfig: an empty decisionLogPath option disables logging (not ignored)", () => {
+  const { config, warnings } = loadConfig(
+    { decisionLogPath: "" },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.decisionLogPath, "")
+  assert.equal(warnings.length, 0, "an empty path is a valid 'disable' value, not a warning")
+})
+
+test("loadConfig: wrong-typed decision-log options are ignored and warn", () => {
+  const { config, warnings } = loadConfig(
+    { decisionLogMaxBytes: "big", decisionLogBackups: -1, toastDecisions: "yes" },
+    { JEV_API_KEY: "k", JEV_BASE_URL: "https://env.example/v1" },
+    "k",
+  )
+  assert.equal(config.decisionLogMaxBytes, 1_000_000)
+  assert.equal(config.decisionLogBackups, 3)
+  assert.equal(config.toastDecisions, false)
+  assert.deepEqual(
+    warnings.map((w) => w.field).sort(),
+    ["decisionLogBackups", "decisionLogMaxBytes", "toastDecisions"],
+  )
 })
