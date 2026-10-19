@@ -63,10 +63,33 @@ function scoreBody(id: string, score: number): string {
 /** A captured log entry. */
 type LogEntry = { body: Record<string, unknown> }
 
-/** Build a stub PluginInput capturing logs and toasts. */
-function stubInput(): { input: PluginInput; logs: LogEntry[]; toasts: unknown[] } {
+/** A message as returned by `client.session.messages`, reduced to what the hook reads. */
+type MessageStub = { info: Record<string, unknown>; parts: Array<{ type: string; text?: string }> }
+
+/** Options controlling the stubbed session message read. */
+type StubInputOptions = {
+  /** Messages the stubbed `client.session.messages` resolves with. */
+  messages?: MessageStub[]
+  /** When set, the stubbed `client.session.messages` rejects with this error. */
+  messagesError?: Error
+}
+
+/** One text message, used as the default session content in hook tests. */
+function textMessage(text: string): MessageStub {
+  return { info: {}, parts: [{ type: "text", text }] }
+}
+
+/** Build a stub PluginInput capturing logs, toasts, and session reads. */
+function stubInput(options?: StubInputOptions): {
+  input: PluginInput
+  logs: LogEntry[]
+  toasts: unknown[]
+  sessionReads: string[]
+} {
   const logs: LogEntry[] = []
   const toasts: unknown[] = []
+  const sessionReads: string[] = []
+  const messages = options?.messages ?? [textMessage("Refactor the parser and keep the tests green.")]
   const client = {
     app: {
       log: async (entry: LogEntry) => {
@@ -80,6 +103,13 @@ function stubInput(): { input: PluginInput; logs: LogEntry[]; toasts: unknown[] 
         return {}
       },
     },
+    session: {
+      messages: async (request: { path: { id: string } }) => {
+        sessionReads.push(request.path.id)
+        if (options?.messagesError) throw options.messagesError
+        return { data: messages }
+      },
+    },
   }
   const input = {
     client,
@@ -90,7 +120,7 @@ function stubInput(): { input: PluginInput; logs: LogEntry[]; toasts: unknown[] 
     serverUrl: new URL("http://localhost"),
     $: undefined,
   } as unknown as PluginInput
-  return { input, logs, toasts }
+  return { input, logs, toasts, sessionReads }
 }
 
 /** Route the stubbed fetch to a per-question body by inspecting the request. */
@@ -341,16 +371,30 @@ test("chat.message: a low-stakes message makes no provider call and no toast", a
   assert.equal(called, false, "a low-stakes message must not call the provider")
 })
 
-test("experimental.session.compacting: appends the preservation reminder on a confident yes", async () => {
-  const { input } = stubInput()
-  routeFetch(() => new Response(noulBody("unrecoverable", 0.9), { status: 200 }))
+test("experimental.session.compacting: judges the fetched session text and appends the reminder on a confident yes", async () => {
+  const { input, sessionReads } = stubInput({
+    messages: [
+      textMessage("We decided to keep the cache TTL at 60s."),
+      { info: {}, parts: [{ type: "reasoning" }, { type: "text", text: "Unresolved: flaky retry test." }] },
+    ],
+  })
+  let state = ""
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    state = (JSON.parse(String(init?.body)) as { state: string }).state
+    return new Response(noulBody("unrecoverable", 0.9), { status: 200 })
+  }) as typeof fetch
   const hooks = await plugin(input)
   const compact = hooks["experimental.session.compacting"]
   assert.ok(compact)
-  const output: { context: string[] } = { context: [] }
-  await compact({ sessionID: "s" }, output)
+  const output: { context: string[]; prompt?: string } = { context: [] }
+  await compact({ sessionID: "session-1" }, output)
+  assert.deepEqual(sessionReads, ["session-1"], "the hook must read the session named by its input")
+  assert.match(state, /cache TTL at 60s/, "the state must carry real session text")
+  assert.match(state, /Unresolved: flaky retry test/, "text parts from later messages must be included")
+  assert.equal(state.includes("reasoning"), false, "non-text parts must be dropped")
   assert.equal(output.context.length, 1)
   assert.match(output.context[0] ?? "", /unrecoverable state/)
+  assert.equal(output.prompt, undefined, "the compaction prompt must never be replaced")
 })
 
 test("experimental.session.compacting: no reminder on a confident no", async () => {
@@ -359,9 +403,60 @@ test("experimental.session.compacting: no reminder on a confident no", async () 
   const hooks = await plugin(input)
   const compact = hooks["experimental.session.compacting"]
   assert.ok(compact)
-  const output: { context: string[] } = { context: [] }
+  const output: { context: string[]; prompt?: string } = { context: [] }
   await compact({ sessionID: "s" }, output)
   assert.equal(output.context.length, 0)
+  assert.equal(output.prompt, undefined)
+})
+
+test("experimental.session.compacting: bounds the fetched session text", async () => {
+  const { input } = stubInput({ messages: [textMessage("x".repeat(10_000))] })
+  let state = ""
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    state = (JSON.parse(String(init?.body)) as { state: string }).state
+    return new Response(noulBody("unrecoverable", 0.9), { status: 200 })
+  }) as typeof fetch
+  const hooks = await plugin(input)
+  const compact = hooks["experimental.session.compacting"]
+  assert.ok(compact)
+  const output: { context: string[] } = { context: [] }
+  await compact({ sessionID: "s" }, output)
+  assert.ok(state.length <= 4000, `state must be capped at 4000 chars, got ${state.length}`)
+})
+
+test("experimental.session.compacting: a failed session read skips Jev and pushes nothing", async () => {
+  const { input, sessionReads } = stubInput({ messagesError: new Error("session unavailable") })
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(noulBody("unrecoverable", 0.99), { status: 200 })
+  })
+  const hooks = await plugin(input)
+  const compact = hooks["experimental.session.compacting"]
+  assert.ok(compact)
+  const output: { context: string[]; prompt?: string } = { context: [] }
+  await compact({ sessionID: "s" }, output)
+  assert.deepEqual(sessionReads, ["s"])
+  assert.equal(called, false, "no Jev call may be made without session content")
+  assert.equal(output.context.length, 0)
+  assert.equal(output.prompt, undefined)
+})
+
+test("experimental.session.compacting: an empty session read skips Jev and pushes nothing", async () => {
+  const { input } = stubInput({ messages: [{ info: {}, parts: [{ type: "reasoning" }] }] })
+  let called = false
+  routeFetch(() => {
+    called = true
+    return new Response(noulBody("unrecoverable", 0.99), { status: 200 })
+  })
+  const hooks = await plugin(input)
+  const compact = hooks["experimental.session.compacting"]
+  assert.ok(compact)
+  const output: { context: string[]; prompt?: string } = { context: [] }
+  await compact({ sessionID: "s" }, output)
+  assert.equal(called, false, "a session with no text must not be judged")
+  assert.equal(output.context.length, 0)
+  assert.equal(output.prompt, undefined)
 })
 
 test("event: session.error with a fatal verdict raises an error toast", async () => {

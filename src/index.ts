@@ -42,7 +42,7 @@ import type { Hooks, Plugin, PluginOptions } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { choice, noul, score, type Question } from "@typesafe-ai/sdk"
 
-import { errorMessage, safeStringify, SystemOneClient } from "./client.ts"
+import { errorMessage, safeStringify, SystemOneClient, truncateState } from "./client.ts"
 import { loadConfig, type DisabledReason } from "./config.ts"
 import {
   appendDecision,
@@ -339,6 +339,34 @@ export default (async (input, options?: PluginOptions) => {
       await client.tui.showToast({ body: { message, variant, title, duration: 5000 } })
     } catch {
       // A toast failure must never break a hook.
+    }
+  }
+
+  /**
+   * Read bounded text from a session's recent messages.
+   *
+   * The compaction hook input carries only a session id, so the hook must read
+   * the session itself. At most the latest 50 messages are fetched, only text
+   * parts are kept, and the joined result is capped by `truncateState`.
+   *
+   * @param sessionID - The session being compacted.
+   * @returns Bounded session text, or undefined when the read fails or is empty.
+   */
+  const fetchSessionText = async (sessionID: string): Promise<string | undefined> => {
+    try {
+      const result = await client.session.messages({
+        path: { id: sessionID },
+        query: { limit: 50 },
+      })
+      const text = (result.data ?? [])
+        .map((message) => extractText(message.parts))
+        .filter((part) => part.length > 0)
+        .join("\n")
+        .trim()
+      return text.length > 0 ? truncateState(text) : undefined
+    } catch (error) {
+      await log("warn", "Jev compaction session read failed", { error: errorMessage(error) })
+      return undefined
     }
   }
 
@@ -776,14 +804,19 @@ export default (async (input, options?: PluginOptions) => {
         await log("warn", "Jev cascade classification failed", { error: errorMessage(error) })
       }
     },
-    "experimental.session.compacting": async (_hookInput, output) => {
+    "experimental.session.compacting": async (hookInput, output) => {
       if (!config.enabled) return
       try {
+        // Fail open when the session cannot be read or holds no text: a
+        // judgement on an empty state would be vacuous, and the reminder must
+        // never be pushed without evidence.
+        const text = await fetchSessionText(hookInput.sessionID)
+        if (!text) return
         const decision = await classifyNoul(
           systemOne,
           COMPACT_QUESTION_ID,
           COMPACT_INSTRUCTIONS,
-          { context: output.context },
+          { context: [text] },
           { trace: { hook: "experimental.session.compacting", summary: COMPACT_QUESTION_ID } },
         )
         if (decision.kind !== "valid") {
